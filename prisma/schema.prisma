@@ -1,0 +1,57 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Config {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+}
+
+model EventLog {
+  id        Int      @id @default(autoincrement())
+  type      String
+  status    String
+  phone     String?
+  jid       String?
+  lid       String?
+  rawJid    String?
+  payload   Json?
+  response  Json?
+  error     String?
+  createdAt DateTime @default(now())
+
+  @@index([type])
+  @@index([status])
+  @@index([phone])
+  @@index([createdAt])
+}
+
+model MessageLog {
+  id                Int      @id @default(autoincrement())
+  direction         String
+  chatType          String
+  phone             String?
+  jid               String?
+  lid               String?
+  rawJid            String?
+  messageType       String
+  content           String?
+  externalMessageId String?
+  outboxId          Int?
+  mediaUrl          String?
+  mimetype          String?
+  createdAt         DateTime @default(now())
+
+  @@index([direction])
+  @@index([phone])
+  @@index([externalMessageId])
+  @@index([outboxId])
+  @@index([createdAt])
+}
