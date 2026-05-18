@@ -2,7 +2,7 @@ FROM node:22-alpine
 
 WORKDIR /app
 
-# Dependencias necesarias para npm install / Baileys / Prisma
+# Dependencias necesarias para npm install / Baileys / Prisma / bcrypt
 RUN apk add --no-cache \
     git \
     python3 \

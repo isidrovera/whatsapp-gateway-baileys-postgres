@@ -55,3 +55,141 @@ model MessageLog {
   @@index([outboxId])
   @@index([createdAt])
 }
+
+model User {
+  id                  String    @id @default(uuid())
+  username            String    @unique
+  email               String?   @unique
+  passwordHash        String
+  active              Boolean   @default(true)
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  lastLoginAt         DateTime?
+
+  sessions    Session[]
+  resetTokens PasswordResetToken[]
+
+  @@index([username])
+  @@index([email])
+}
+
+model Session {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+  expiresAt  DateTime
+  revokedAt  DateTime?
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model SmtpConfig {
+  id                Int       @id @default(autoincrement())
+  singleton         Boolean   @default(true) @unique
+  active            Boolean   @default(false)
+  host              String
+  port              Int       @default(587)
+  secure            Boolean   @default(false)
+  authMethod        String    @default("PASSWORD")
+  username          String?
+  passwordEncrypted String?
+  fromName          String
+  fromEmail         String
+  replyTo           String?
+  lastTestAt        DateTime?
+  lastTestOk        Boolean?
+  lastTestError     String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+}
+
+model EmailTemplate {
+  id          String   @id @default(uuid())
+  code        String   @unique
+  name        String
+  description String?
+  subject     String
+  bodyHtml    String
+  bodyText    String?
+  variables   Json?
+  active      Boolean  @default(true)
+  isSystem    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([code])
+}
+
+model EmailLog {
+  id           Int       @id @default(autoincrement())
+  toAddress    String
+  ccAddress    String?
+  bccAddress   String?
+  subject      String
+  bodyHtml     String?
+  bodyText     String?
+  templateCode String?
+  variables    Json?
+  status       String    @default("PENDING")
+  attempts     Int       @default(0)
+  lastError    String?
+  sentAt       DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([toAddress])
+  @@index([status])
+  @@index([templateCode])
+  @@index([createdAt])
+}
+
+model NotificationRule {
+  id              String    @id @default(uuid())
+  eventType       String    @unique
+  name            String
+  description     String?
+  active          Boolean   @default(true)
+  templateCode    String
+  throttleMinutes Int       @default(0)
+  lastTriggeredAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  recipients NotificationRecipient[]
+
+  @@index([eventType])
+  @@index([active])
+}
+
+model NotificationRecipient {
+  id        String           @id @default(uuid())
+  ruleId    String
+  rule      NotificationRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  email     String
+  active    Boolean          @default(true)
+  createdAt DateTime         @default(now())
+
+  @@unique([ruleId, email])
+  @@index([ruleId])
+}

@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>Setup inicial · WhatsApp Gateway</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #f4f6fb;
+      --card: #ffffff;
+      --primary: #2563eb;
+      --primary-dark: #1d4ed8;
+      --success: #059669;
+      --danger: #dc2626;
+      --warning: #d97706;
+      --dark: #111827;
+      --muted: #6b7280;
+      --border: #d1d5db;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: Arial, sans-serif;
+      background: var(--bg);
+      margin: 0;
+      color: #1f2937;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+
+    .card {
+      background: var(--card);
+      border-radius: 14px;
+      padding: 28px;
+      box-shadow: 0 4px 18px rgba(0,0,0,.10);
+      border: 1px solid #e5e7eb;
+      width: 100%;
+      max-width: 460px;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 22px;
+      color: var(--dark);
+    }
+
+    .subtitle {
+      margin: 0 0 18px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    label {
+      display: block;
+      margin-top: 12px;
+      font-size: 13px;
+      font-weight: bold;
+    }
+
+    input {
+      width: 100%;
+      padding: 10px;
+      margin-top: 5px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      outline: none;
+      font-size: 14px;
+    }
+
+    input:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(37,99,235,.15);
+    }
+
+    button {
+      border: none;
+      border-radius: 9px;
+      padding: 11px 14px;
+      margin-top: 18px;
+      cursor: pointer;
+      background: var(--primary);
+      color: white;
+      font-weight: bold;
+      font-size: 14px;
+      width: 100%;
+    }
+
+    button:hover {
+      background: var(--primary-dark);
+    }
+
+    button:disabled {
+      opacity: .6;
+      cursor: not-allowed;
+    }
+
+    .alert {
+      padding: 10px 12px;
+      border-radius: 9px;
+      margin-top: 14px;
+      font-size: 13px;
+      display: none;
+    }
+
+    .alert.error {
+      background: #fee2e2;
+      color: #991b1b;
+    }
+
+    .alert.success {
+      background: #dcfce7;
+      color: #166534;
+    }
+
+    .muted {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 8px;
+      line-height: 1.4;
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: #eef2ff;
+      color: #3730a3;
+      font-weight: bold;
+      font-size: 12px;
+      margin-bottom: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <span class="pill">Configuración inicial</span>
+    <h1>Crear usuario administrador</h1>
+    <p class="subtitle">
+      Es la primera vez que inicias el gateway. Crea el usuario administrador para acceder al panel.
+    </p>
+
+    <label for="username">Usuario</label>
+    <input id="username" type="text" placeholder="admin" autocomplete="username" />
+
+    <label for="email">Email (opcional)</label>
+    <input id="email" type="email" placeholder="tu@correo.com" autocomplete="email" />
+    <div class="muted">Se usará en el futuro para recuperar contraseña y notificaciones.</div>
+
+    <label for="password">Contraseña</label>
+    <input id="password" type="password" placeholder="Mínimo 8 caracteres" autocomplete="new-password" />
+
+    <label for="password2">Repetir contraseña</label>
+    <input id="password2" type="password" placeholder="Repite la contraseña" autocomplete="new-password" />
+
+    <button id="submitBtn" onclick="submitSetup()">Crear administrador</button>
+
+    <div id="alert" class="alert"></div>
+  </div>
+
+<script>
+  function showAlert(type, message) {
+    const el = document.getElementById('alert');
+    el.className = 'alert ' + type;
+    el.textContent = message;
+    el.style.display = 'block';
+  }
+
+  function hideAlert() {
+    document.getElementById('alert').style.display = 'none';
+  }
+
+  async function submitSetup() {
+    hideAlert();
+
+    const username = document.getElementById('username').value.trim();
+    const email = document.getElementById('email').value.trim();
+    const password = document.getElementById('password').value;
+    const password2 = document.getElementById('password2').value;
+
+    if (!username || username.length < 3) {
+      showAlert('error', 'El usuario debe tener al menos 3 caracteres.');
+      return;
+    }
+
+    if (password.length < 8) {
+      showAlert('error', 'La contraseña debe tener al menos 8 caracteres.');
+      return;
+    }
+
+    if (password !== password2) {
+      showAlert('error', 'Las contraseñas no coinciden.');
+      return;
+    }
+
+    const btn = document.getElementById('submitBtn');
+    btn.disabled = true;
+    btn.textContent = 'Creando...';
+
+    try {
+      const body = { username, password };
+      if (email) body.email = email;
+
+      const res = await fetch('/api/session/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(body)
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || !data.ok) {
+        showAlert('error', data.message || 'No se pudo crear el administrador.');
+        btn.disabled = false;
+        btn.textContent = 'Crear administrador';
+        return;
+      }
+
+      showAlert('success', 'Administrador creado. Redirigiendo...');
+      setTimeout(() => { window.location.href = '/'; }, 800);
+    } catch (e) {
+      showAlert('error', 'Error de red. Revisa la conexión.');
+      btn.disabled = false;
+      btn.textContent = 'Crear administrador';
+    }
+  }
+
+  document.addEventListener('keydown', function(ev) {
+    if (ev.key === 'Enter') submitSetup();
+  });
+
+  (async function check() {
+    try {
+      const res = await fetch('/api/session/status', { credentials: 'include' });
+      const data = await res.json();
+      if (data.ok && !data.setupRequired) {
+        window.location.href = '/';
+      }
+    } catch {}
+  })();
+</script>
+</body>
+</html>

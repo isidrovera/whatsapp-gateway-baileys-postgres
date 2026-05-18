@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>Iniciar sesión · WhatsApp Gateway</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #f4f6fb;
+      --card: #ffffff;
+      --primary: #2563eb;
+      --primary-dark: #1d4ed8;
+      --success: #059669;
+      --danger: #dc2626;
+      --warning: #d97706;
+      --dark: #111827;
+      --muted: #6b7280;
+      --border: #d1d5db;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: Arial, sans-serif;
+      background: var(--bg);
+      margin: 0;
+      color: #1f2937;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+
+    .card {
+      background: var(--card);
+      border-radius: 14px;
+      padding: 28px;
+      box-shadow: 0 4px 18px rgba(0,0,0,.10);
+      border: 1px solid #e5e7eb;
+      width: 100%;
+      max-width: 420px;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 22px;
+      color: var(--dark);
+    }
+
+    .subtitle {
+      margin: 0 0 18px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    label {
+      display: block;
+      margin-top: 12px;
+      font-size: 13px;
+      font-weight: bold;
+    }
+
+    input {
+      width: 100%;
+      padding: 10px;
+      margin-top: 5px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      outline: none;
+      font-size: 14px;
+    }
+
+    input:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(37,99,235,.15);
+    }
+
+    button {
+      border: none;
+      border-radius: 9px;
+      padding: 11px 14px;
+      margin-top: 18px;
+      cursor: pointer;
+      background: var(--primary);
+      color: white;
+      font-weight: bold;
+      font-size: 14px;
+      width: 100%;
+    }
+
+    button:hover {
+      background: var(--primary-dark);
+    }
+
+    button:disabled {
+      opacity: .6;
+      cursor: not-allowed;
+    }
+
+    .alert {
+      padding: 10px 12px;
+      border-radius: 9px;
+      margin-top: 14px;
+      font-size: 13px;
+      display: none;
+    }
+
+    .alert.error {
+      background: #fee2e2;
+      color: #991b1b;
+    }
+
+    .alert.success {
+      background: #dcfce7;
+      color: #166534;
+    }
+
+    .alert.warning {
+      background: #fef3c7;
+      color: #92400e;
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: #eef2ff;
+      color: #3730a3;
+      font-weight: bold;
+      font-size: 12px;
+      margin-bottom: 12px;
+    }
+
+    .toggle-pass {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 6px;
+      font-size: 12px;
+      color: var(--muted);
+      cursor: pointer;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <span class="pill">Acceso administrador</span>
+    <h1>Iniciar sesión</h1>
+    <p class="subtitle">Ingresa tus credenciales para acceder al panel del gateway.</p>
+
+    <label for="username">Usuario</label>
+    <input id="username" type="text" placeholder="admin" autocomplete="username" />
+
+    <label for="password">Contraseña</label>
+    <input id="password" type="password" placeholder="Tu contraseña" autocomplete="current-password" />
+
+    <label class="toggle-pass">
+      <input type="checkbox" id="showPass" onchange="togglePass()" />
+      Mostrar contraseña
+    </label>
+
+    <button id="submitBtn" onclick="submitLogin()">Entrar</button>
+
+    <div id="alert" class="alert"></div>
+  </div>
+
+<script>
+  function togglePass() {
+    const input = document.getElementById('password');
+    const cb = document.getElementById('showPass');
+    input.type = cb.checked ? 'text' : 'password';
+  }
+
+  function showAlert(type, message) {
+    const el = document.getElementById('alert');
+    el.className = 'alert ' + type;
+    el.textContent = message;
+    el.style.display = 'block';
+  }
+
+  function hideAlert() {
+    document.getElementById('alert').style.display = 'none';
+  }
+
+  async function submitLogin() {
+    hideAlert();
+
+    const username = document.getElementById('username').value.trim();
+    const password = document.getElementById('password').value;
+
+    if (!username || !password) {
+      showAlert('error', 'Completa usuario y contraseña.');
+      return;
+    }
+
+    const btn = document.getElementById('submitBtn');
+    btn.disabled = true;
+    btn.textContent = 'Entrando...';
+
+    try {
+      const res = await fetch('/api/session/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ username, password })
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || !data.ok) {
+        let msg = data.message || 'No se pudo iniciar sesión.';
+
+        if (data.code === 'LOCKED' && data.lockedUntil) {
+          const until = new Date(data.lockedUntil).toLocaleString();
+          msg = 'Cuenta bloqueada hasta ' + until + '.';
+        }
+
+        showAlert(data.code === 'LOCKED' ? 'warning' : 'error', msg);
+        btn.disabled = false;
+        btn.textContent = 'Entrar';
+        return;
+      }
+
+      showAlert('success', 'Sesión iniciada. Redirigiendo...');
+      setTimeout(() => { window.location.href = '/'; }, 500);
+    } catch (e) {
+      showAlert('error', 'Error de red. Revisa la conexión.');
+      btn.disabled = false;
+      btn.textContent = 'Entrar';
+    }
+  }
+
+  document.addEventListener('keydown', function(ev) {
+    if (ev.key === 'Enter') submitLogin();
+  });
+
+  (async function check() {
+    try {
+      const res = await fetch('/api/session/me', { credentials: 'include' });
+      const data = await res.json();
+
+      if (data.ok && data.setupRequired) {
+        window.location.href = '/static/setup.html';
+        return;
+      }
+
+      if (data.ok && data.authenticated) {
+        window.location.href = '/';
+      }
+    } catch {}
+  })();
+</script>
+</body>
+</html>

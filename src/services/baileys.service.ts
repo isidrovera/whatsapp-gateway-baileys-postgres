@@ -118,6 +118,44 @@ class WhatsAppGateway {
     }, delay);
   }
 
+  private isInternalOrUnsupportedMessage(message: proto.IWebMessageInfo) {
+    const raw: any = message.message || {};
+
+    if (!raw || Object.keys(raw).length === 0) {
+      return true;
+    }
+
+    if (raw.protocolMessage) return true;
+    if (raw.senderKeyDistributionMessage) return true;
+    if (raw.messageContextInfo && Object.keys(raw).length === 1) return true;
+
+    if ((message as any).messageStubType) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private getRemoteJid(message: proto.IWebMessageInfo) {
+    return (
+      message.key?.remoteJid ||
+      message.key?.participant ||
+      ''
+    );
+  }
+
+  private getTimestampMs(message: proto.IWebMessageInfo) {
+    const raw = Number(message.messageTimestamp || 0);
+
+    if (!raw) return Date.now();
+
+    if (raw > 1000000000000) {
+      return raw;
+    }
+
+    return raw * 1000;
+  }
+
   async initialize(forceNew = false) {
     const authDir = await this.getAuthDir();
 
@@ -213,9 +251,20 @@ class WhatsAppGateway {
     );
 
     this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
+      logger.info(
+        {
+          type,
+          count: messages?.length || 0,
+        },
+        '[WA-IN] messages.upsert recibido'
+      );
 
-      for (const msg of messages) {
+      if (type !== 'notify') {
+        logger.debug({ type }, '[WA-IN] upsert ignorado por tipo');
+        return;
+      }
+
+      for (const msg of messages || []) {
         await this.handleIncomingMessage(msg);
       }
     });
@@ -458,31 +507,58 @@ class WhatsAppGateway {
       message_type: messageType,
       message_id: message.key?.id || '',
       push_name: message.pushName || '',
-      timestamp: new Date(
-        Number(message.messageTimestamp || Date.now() / 1000) * 1000
-      ).toISOString(),
+      timestamp: new Date(this.getTimestampMs(message)).toISOString(),
     }).catch((err) =>
       logger.warn({ err }, 'No se pudo reportar grupo al webhook')
     );
   }
 
   private async handleIncomingMessage(message: proto.IWebMessageInfo) {
+    const messageId = message.key?.id || '';
+    const remoteJid = this.getRemoteJid(message);
+
     try {
-      if (Number(message.messageTimestamp || 0) * 1000 < this.startTime) {
+      logger.info(
+        {
+          messageId,
+          remoteJid,
+          fromMe: message.key?.fromMe || false,
+          participant: message.key?.participant || '',
+          hasMessage: !!message.message,
+          keys: message.message ? Object.keys(message.message as any) : [],
+        },
+        '[WA-IN] mensaje recibido'
+      );
+
+      if (this.getTimestampMs(message) < this.startTime - 15000) {
+        logger.info({ messageId }, '[WA-IN] mensaje antiguo ignorado');
         return;
       }
 
-      const remoteJid = message.key?.remoteJid || message.key?.participant || '';
-
       if (!remoteJid || remoteJid === 'status@broadcast') {
+        logger.info({ messageId, remoteJid }, '[WA-IN] jid vacío/status ignorado');
         return;
       }
 
       if (message.key?.fromMe) {
+        logger.info({ messageId, remoteJid }, '[WA-IN] mensaje propio ignorado');
         return;
       }
 
-      if (this.isFromBotById(message.key?.id)) {
+      if (this.isFromBotById(messageId)) {
+        logger.info({ messageId, remoteJid }, '[WA-IN] mensaje enviado por bot ignorado');
+        return;
+      }
+
+      if (this.isInternalOrUnsupportedMessage(message)) {
+        logger.info(
+          {
+            messageId,
+            remoteJid,
+            keys: message.message ? Object.keys(message.message as any) : [],
+          },
+          '[WA-IN] mensaje interno/no soportado ignorado'
+        );
         return;
       }
 
@@ -490,22 +566,35 @@ class WhatsAppGateway {
       const messageType = getMessageType(message);
 
       if (isGroupJid(remoteJid)) {
-        logger.info(
-          {
-            remoteJid,
-          },
-          'Grupo ignorado'
-        );
-
-        await this.reportGroup(message, remoteJid, text, messageType);
-        return;
+        if (await getBooleanConfig('IGNORE_GROUPS')) {
+          logger.info({ remoteJid }, '[WA-IN] grupo ignorado');
+          await this.reportGroup(message, remoteJid, text, messageType);
+          return;
+        }
       }
 
       const ids = extractIdentifiers(remoteJid, message.key);
 
+      logger.info(
+        {
+          messageId,
+          remoteJid,
+          phone: ids.phone,
+          jid: ids.jid,
+          lid: ids.lid,
+          raw_jid: ids.raw_jid,
+          alt_jid: ids.alt_jid,
+          candidates: ids.candidates,
+          key: message.key,
+          messageType,
+          text,
+        },
+        '[WA-IN] mensaje normalizado'
+      );
+
       const media = await this.buildMediaPayload(message, messageType).catch(
         (err) => {
-          logger.error({ err }, 'Error descargando media');
+          logger.error({ err, messageId }, '[WA-IN] error descargando media');
           return null;
         }
       );
@@ -513,28 +602,29 @@ class WhatsAppGateway {
       const finalText = text || (media ? `[El usuario envió ${messageType}]` : '');
 
       if (!finalText && !media) {
+        logger.info({ messageId, messageType }, '[WA-IN] sin texto ni media, ignorado');
         return;
       }
 
       await prisma.messageLog.create({
         data: {
           direction: 'in',
-          chatType: 'private',
+          chatType: isGroupJid(remoteJid) ? 'group' : 'private',
           phone: ids.phone || null,
           jid: ids.jid || null,
           lid: ids.lid || null,
           rawJid: ids.raw_jid || null,
           messageType,
           content: finalText,
-          externalMessageId: message.key?.id || null,
+          externalMessageId: messageId || null,
           mediaUrl: media?.url || null,
           mimetype: media?.mimetype || null,
         },
       });
 
-      const response = await postToInboundWebhook({
+      const inboundPayload = {
         source: 'baileys_gateway',
-        chat_type: 'private',
+        chat_type: isGroupJid(remoteJid) ? 'group' : 'private',
         phone: ids.phone,
         from: remoteJid,
         jid: ids.jid,
@@ -543,25 +633,56 @@ class WhatsAppGateway {
         alt_jid: ids.alt_jid,
         message: finalText,
         message_type: messageType,
-        message_id: message.key?.id || '',
+        message_id: messageId,
         push_name: message.pushName || '',
-        timestamp: new Date(
-          Number(message.messageTimestamp || Date.now() / 1000) * 1000
-        ).toISOString(),
+        timestamp: new Date(this.getTimestampMs(message)).toISOString(),
         media,
-      });
+      };
+
+      logger.info(
+        {
+          messageId,
+          phone: ids.phone,
+          message: finalText,
+        },
+        '[WA-IN] enviando a webhook n8n'
+      );
+
+      const response = await postToInboundWebhook(inboundPayload);
+
+      logger.info(
+        {
+          messageId,
+          ok: response?.ok,
+          shouldSend: response?.shouldSend,
+          outbox_id: response?.outbox_id,
+          message: response?.message,
+        },
+        '[WA-IN] respuesta webhook n8n'
+      );
 
       if (!response?.ok || !response.shouldSend) {
+        logger.info({ messageId }, '[WA-IN] webhook no pidió responder');
         return;
       }
 
       const responseText = String(response.message || '').trim();
 
       if (!responseText) {
+        logger.info({ messageId }, '[WA-IN] webhook sin texto de respuesta');
         return;
       }
 
       const sent = await this.sendText(remoteJid, responseText);
+
+      logger.info(
+        {
+          messageId,
+          externalMessageId: sent?.key?.id,
+          outbox_id: response.outbox_id,
+        },
+        '[WA-IN] respuesta enviada por WhatsApp'
+      );
 
       if (response.outbox_id) {
         await markOdooOutboxSent(
@@ -573,9 +694,11 @@ class WhatsAppGateway {
       logger.error(
         {
           err,
-          messageId: message.key?.id,
+          messageId,
+          remoteJid,
+          keys: message.message ? Object.keys(message.message as any) : [],
         },
-        'Error manejando mensaje'
+        '[WA-IN] Error manejando mensaje'
       );
     }
   }
