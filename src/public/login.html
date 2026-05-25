@@ -143,6 +143,18 @@
       cursor: pointer;
       user-select: none;
     }
+    .links {
+      margin-top: 14px;
+      text-align: center;
+      font-size: 13px;
+    }
+    .links a {
+      color: var(--primary);
+      text-decoration: none;
+    }
+    .links a:hover {
+      text-decoration: underline;
+    }
   </style>
 </head>
 <body>
@@ -165,6 +177,10 @@
     <button id="submitBtn" onclick="submitLogin()">Entrar</button>
 
     <div id="alert" class="alert"></div>
+
+    <div class="links">
+      <a href="/static/forgot.html">¿Olvidaste tu contraseña?</a>
+    </div>
   </div>
 
 <script>

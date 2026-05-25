@@ -65,7 +65,18 @@
       font-size: 13px;
       color: #e5e7eb;
     }
-
+    .nav-link {
+      background: rgba(255,255,255,.1);
+      color: white;
+      text-decoration: none;
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: bold;
+    }
+    .nav-link:hover {
+      background: rgba(255,255,255,.2);
+    }
     .logout-btn {
       background: var(--danger);
       color: white;
@@ -362,6 +373,9 @@
       <div class="sub">Panel de administración con PostgreSQL</div>
     </div>
     <div class="user-box">
+      <a class="nav-link" href="/static/smtp.html">📧 SMTP</a>
+      <a class="nav-link" href="/static/templates.html">📝 Plantillas</a>
+      <a class="nav-link" href="/static/notifications.html">🔔 Notificaciones</a>
       <span class="user-pill" id="userPill">👤 ...</span>
       <button class="change-pass-btn" onclick="openChangePassword()">Cambiar contraseña</button>
       <button class="logout-btn" onclick="doLogout()">Cerrar sesión</button>
@@ -1000,6 +1014,8 @@
 
   loadCurrentUser();
   loadStatus();
+  loadConfig();
+  loadApiKeys();
 </script>
 </body>
 </html>

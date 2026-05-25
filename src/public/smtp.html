@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>Servidor de correo · WhatsApp Gateway</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #f4f6fb;
+      --card: #ffffff;
+      --primary: #2563eb;
+      --primary-dark: #1d4ed8;
+      --success: #059669;
+      --danger: #dc2626;
+      --warning: #d97706;
+      --dark: #111827;
+      --muted: #6b7280;
+      --border: #d1d5db;
+    }
+    * { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; background: var(--bg); margin: 0; color: #1f2937; }
+
+    header {
+      background: var(--dark); color: white; padding: 18px 24px;
+      display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;
+    }
+    header h1 { margin: 0; font-size: 22px; }
+    .back-btn {
+      background: rgba(255,255,255,.15); color: white; border: none;
+      border-radius: 8px; padding: 8px 14px; cursor: pointer; font-size: 13px; text-decoration: none;
+    }
+    .back-btn:hover { background: rgba(255,255,255,.25); }
+
+    main { max-width: 920px; margin: 24px auto; padding: 0 16px 40px; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+
+    .card {
+      background: var(--card); border-radius: 14px; padding: 18px;
+      box-shadow: 0 2px 10px rgba(0,0,0,.08); border: 1px solid #e5e7eb;
+    }
+    h2 { margin: 0 0 12px; font-size: 18px; }
+    label { display: block; margin-top: 10px; font-size: 13px; font-weight: bold; }
+    input, select {
+      width: 100%; padding: 10px; margin-top: 5px;
+      border: 1px solid var(--border); border-radius: 9px; outline: none; font-size: 14px;
+    }
+    input:focus, select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
+
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
+
+    button {
+      border: none; border-radius: 9px; padding: 10px 14px; cursor: pointer;
+      background: var(--primary); color: white; font-weight: bold; font-size: 14px;
+    }
+    button:hover { background: var(--primary-dark); }
+    button.secondary { background: #4b5563; }
+    button.secondary:hover { background: #374151; }
+    button.success { background: var(--success); }
+    button.warning { background: var(--warning); }
+    button.danger { background: var(--danger); }
+    button.small { padding: 7px 10px; font-size: 12px; }
+
+    .muted { color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 600px) { .grid-2 { grid-template-columns: 1fr; } }
+
+    .alert {
+      padding: 10px 12px; border-radius: 9px; margin-top: 14px; font-size: 13px;
+    }
+    .alert.error { background: #fee2e2; color: #991b1b; }
+    .alert.success { background: #dcfce7; color: #166534; }
+    .alert.warning { background: #fef3c7; color: #92400e; }
+    .alert.info { background: #dbeafe; color: #1e40af; }
+
+    .test-result {
+      margin-top: 12px; padding: 10px; border-radius: 9px;
+      background: #f9fafb; border: 1px solid #e5e7eb; font-size: 13px;
+    }
+    .test-result.ok { background: #dcfce7; border-color: #86efac; }
+    .test-result.fail { background: #fee2e2; border-color: #fca5a5; }
+
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+    th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #e5e7eb; }
+    th { background: #f9fafb; font-weight: bold; }
+    td.status-sent { color: #166534; font-weight: bold; }
+    td.status-failed { color: #991b1b; font-weight: bold; }
+    td.status-pending { color: #92400e; font-weight: bold; }
+    .truncate { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .toggle-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+    .toggle-row input[type="checkbox"] { width: auto; margin: 0; }
+
+    .preset {
+      display: inline-block; padding: 4px 10px; border-radius: 999px;
+      background: #eef2ff; color: #3730a3; font-size: 12px; cursor: pointer; margin-right: 6px;
+    }
+    .preset:hover { background: #c7d2fe; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Servidor de correo</h1>
+    <a class="back-btn" href="/">← Volver al panel</a>
+  </header>
+
+  <main>
+    <div class="grid">
+
+      <section class="card">
+        <h2>Configuración SMTP</h2>
+        <p class="muted">
+          Configura el servidor SMTP para enviar correos. Funciona con Gmail (App Password), Office365, Mailgun, SendGrid, AWS SES y cualquier servidor SMTP estándar.
+        </p>
+
+        <div style="margin-top:10px;">
+          <span class="preset" onclick="loadPreset('gmail')">Gmail</span>
+          <span class="preset" onclick="loadPreset('office365')">Office365</span>
+          <span class="preset" onclick="loadPreset('sendgrid')">SendGrid</span>
+          <span class="preset" onclick="loadPreset('mailgun')">Mailgun</span>
+        </div>
+
+        <div class="grid-2">
+          <div>
+            <label>Host SMTP</label>
+            <input id="host" placeholder="smtp.gmail.com" />
+          </div>
+          <div>
+            <label>Puerto</label>
+            <input id="port" type="number" placeholder="587" />
+          </div>
+        </div>
+
+        <div class="toggle-row">
+          <input id="secure" type="checkbox" />
+          <label for="secure" style="margin: 0;">Conexión segura (SSL/TLS directo, marca solo si usas puerto 465)</label>
+        </div>
+
+        <div class="grid-2">
+          <div>
+            <label>Usuario SMTP</label>
+            <input id="username" placeholder="tu@correo.com" autocomplete="off" />
+          </div>
+          <div>
+            <label>Contraseña SMTP</label>
+            <input id="password" type="password" placeholder="(dejar vacío para no cambiar)" autocomplete="new-password" />
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <div>
+            <label>Nombre del remitente</label>
+            <input id="fromName" placeholder="WhatsApp Gateway" />
+          </div>
+          <div>
+            <label>Email del remitente</label>
+            <input id="fromEmail" type="email" placeholder="noreply@tudominio.com" />
+          </div>
+        </div>
+
+        <label>Responder a (opcional)</label>
+        <input id="replyTo" type="email" placeholder="soporte@tudominio.com" />
+
+        <div class="toggle-row">
+          <input id="active" type="checkbox" />
+          <label for="active" style="margin: 0;">Activar envío de correos</label>
+        </div>
+
+        <div class="row">
+          <button class="success" onclick="saveConfig()">Guardar configuración</button>
+          <button class="secondary" onclick="loadConfig()">Recargar</button>
+        </div>
+
+        <div id="saveAlert" class="alert" style="display:none;"></div>
+      </section>
+
+      <section class="card">
+        <h2>Probar envío</h2>
+        <p class="muted">Envía un correo de prueba al destinatario que indiques para validar la configuración.</p>
+
+        <label>Email destino</label>
+        <input id="testTo" type="email" placeholder="destino@correo.com" />
+
+        <div class="row">
+          <button class="warning" onclick="testSmtp()">Enviar prueba</button>
+        </div>
+
+        <div id="testResult"></div>
+      </section>
+
+      <section class="card">
+        <h2>Historial reciente</h2>
+        <div class="row">
+          <button class="secondary small" onclick="loadLogs()">Actualizar historial</button>
+        </div>
+
+        <div id="logsArea">
+          <div class="muted" style="margin-top:10px;">Sin consultar.</div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+<script>
+  const PRESETS = {
+    gmail:     { host: 'smtp.gmail.com',         port: 587, secure: false },
+    office365: { host: 'smtp.office365.com',     port: 587, secure: false },
+    sendgrid:  { host: 'smtp.sendgrid.net',      port: 587, secure: false },
+    mailgun:   { host: 'smtp.mailgun.org',       port: 587, secure: false }
+  };
+
+  function loadPreset(key) {
+    const p = PRESETS[key];
+    if (!p) return;
+    document.getElementById('host').value = p.host;
+    document.getElementById('port').value = p.port;
+    document.getElementById('secure').checked = p.secure;
+  }
+
+  function showAlert(elId, type, message) {
+    const el = document.getElementById(elId);
+    el.className = 'alert ' + type;
+    el.textContent = message;
+    el.style.display = 'block';
+  }
+  function hideAlert(elId) {
+    document.getElementById(elId).style.display = 'none';
+  }
+
+  async function request(path, options) {
+    options = options || {};
+    options.credentials = 'include';
+    const res = await fetch(path, options);
+    const text = await res.text();
+    let data;
+    try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+    if (res.status === 401) {
+      window.location.href = '/static/login.html';
+      throw data;
+    }
+    if (!res.ok) throw data;
+    return data;
+  }
+
+  async function loadConfig() {
+    hideAlert('saveAlert');
+    try {
+      const data = await request('/api/smtp/config');
+      const cfg = data.config;
+      if (!cfg) {
+        document.getElementById('host').value = '';
+        document.getElementById('port').value = '587';
+        document.getElementById('secure').checked = false;
+        document.getElementById('username').value = '';
+        document.getElementById('password').value = '';
+        document.getElementById('fromName').value = '';
+        document.getElementById('fromEmail').value = '';
+        document.getElementById('replyTo').value = '';
+        document.getElementById('active').checked = false;
+        return;
+      }
+
+      document.getElementById('host').value = cfg.host || '';
+      document.getElementById('port').value = cfg.port || 587;
+      document.getElementById('secure').checked = !!cfg.secure;
+      document.getElementById('username').value = cfg.username || '';
+      document.getElementById('password').value = '';
+      document.getElementById('password').placeholder = cfg.hasPassword
+        ? '(contraseña guardada, dejar vacío para no cambiar)'
+        : '(sin contraseña configurada)';
+      document.getElementById('fromName').value = cfg.fromName || '';
+      document.getElementById('fromEmail').value = cfg.fromEmail || '';
+      document.getElementById('replyTo').value = cfg.replyTo || '';
+      document.getElementById('active').checked = !!cfg.active;
+    } catch (e) {
+      showAlert('saveAlert', 'error', (e && e.message) || 'No se pudo cargar la configuración.');
+    }
+  }
+
+  async function saveConfig() {
+    hideAlert('saveAlert');
+    const body = {
+      host: document.getElementById('host').value.trim(),
+      port: parseInt(document.getElementById('port').value, 10) || 587,
+      secure: document.getElementById('secure').checked,
+      authMethod: 'PASSWORD',
+      username: document.getElementById('username').value.trim() || null,
+      fromName: document.getElementById('fromName').value.trim(),
+      fromEmail: document.getElementById('fromEmail').value.trim(),
+      replyTo: document.getElementById('replyTo').value.trim() || null,
+      active: document.getElementById('active').checked
+    };
+
+    const password = document.getElementById('password').value;
+    if (password.length > 0) {
+      body.password = password;
+    }
+
+    if (!body.host || !body.fromEmail || !body.fromName) {
+      showAlert('saveAlert', 'error', 'Host, nombre y email de remitente son obligatorios.');
+      return;
+    }
+
+    try {
+      const data = await request('/api/smtp/config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      showAlert('saveAlert', 'success', data.message || 'Configuración guardada.');
+      document.getElementById('password').value = '';
+      loadConfig();
+    } catch (e) {
+      showAlert('saveAlert', 'error', (e && e.message) || 'No se pudo guardar.');
+    }
+  }
+
+  async function testSmtp() {
+    const to = document.getElementById('testTo').value.trim();
+    const box = document.getElementById('testResult');
+    box.innerHTML = '';
+
+    if (!to) {
+      box.innerHTML = '<div class="test-result fail">Ingresa un email destino.</div>';
+      return;
+    }
+
+    box.innerHTML = '<div class="test-result">Enviando prueba...</div>';
+
+    try {
+      const data = await request('/api/smtp/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to })
+      });
+      box.innerHTML =
+        '<div class="test-result ok">✅ ' + (data.message || 'Email enviado.') +
+        ' <br><small>messageId: ' + (data.messageId || '—') + '</small></div>';
+      loadLogs();
+    } catch (e) {
+      box.innerHTML =
+        '<div class="test-result fail">❌ ' + ((e && e.message) || 'Error desconocido') + '</div>';
+      loadLogs();
+    }
+  }
+
+  function statusClass(status) {
+    if (status === 'SENT') return 'status-sent';
+    if (status === 'FAILED') return 'status-failed';
+    return 'status-pending';
+  }
+
+  async function loadLogs() {
+    const area = document.getElementById('logsArea');
+    area.innerHTML = '<div class="muted" style="margin-top:10px;">Cargando...</div>';
+    try {
+      const data = await request('/api/smtp/logs?limit=50');
+      const logs = data.logs || [];
+      if (logs.length === 0) {
+        area.innerHTML = '<div class="muted" style="margin-top:10px;">No hay correos registrados aún.</div>';
+        return;
+      }
+      let html = '<table><thead><tr>' +
+        '<th>Fecha</th><th>Destino</th><th>Asunto</th><th>Plantilla</th><th>Estado</th><th>Error</th>' +
+        '</tr></thead><tbody>';
+      logs.forEach(function(l) {
+        const created = new Date(l.createdAt).toLocaleString();
+        html += '<tr>' +
+          '<td>' + escapeHtml(created) + '</td>' +
+          '<td class="truncate">' + escapeHtml(l.to || '') + '</td>' +
+          '<td class="truncate">' + escapeHtml(l.subject || '') + '</td>' +
+          '<td>' + escapeHtml(l.templateCode || '—') + '</td>' +
+          '<td class="' + statusClass(l.status) + '">' + escapeHtml(l.status) + '</td>' +
+          '<td class="truncate">' + escapeHtml(l.lastError || '') + '</td>' +
+          '</tr>';
+      });
+      html += '</tbody></table>';
+      area.innerHTML = html;
+    } catch (e) {
+      area.innerHTML = '<div class="alert error" style="display:block;">' +
+        ((e && e.message) || 'No se pudo cargar el historial.') + '</div>';
+    }
+  }
+
+  function escapeHtml(value) {
+    return String(value == null ? '' : value)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#039;');
+  }
+
+  loadConfig();
+  loadLogs();
+</script>
+</body>
+</html>

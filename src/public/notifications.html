@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>Notificaciones · WhatsApp Gateway</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #f4f6fb;
+      --card: #ffffff;
+      --primary: #2563eb;
+      --primary-dark: #1d4ed8;
+      --success: #059669;
+      --danger: #dc2626;
+      --warning: #d97706;
+      --dark: #111827;
+      --muted: #6b7280;
+      --border: #d1d5db;
+    }
+    * { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; background: var(--bg); margin: 0; color: #1f2937; }
+
+    header {
+      background: var(--dark); color: white; padding: 18px 24px;
+      display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;
+    }
+    header h1 { margin: 0; font-size: 22px; }
+    .back-btn {
+      background: rgba(255,255,255,.15); color: white; border: none;
+      border-radius: 8px; padding: 8px 14px; cursor: pointer; font-size: 13px; text-decoration: none;
+    }
+    .back-btn:hover { background: rgba(255,255,255,.25); }
+
+    main { max-width: 1080px; margin: 24px auto; padding: 0 16px 40px; }
+
+    .card {
+      background: var(--card); border-radius: 14px; padding: 18px;
+      box-shadow: 0 2px 10px rgba(0,0,0,.08); border: 1px solid #e5e7eb; margin-bottom: 16px;
+    }
+    h2 { margin: 0 0 12px; font-size: 18px; }
+    h3 { margin: 0 0 8px; font-size: 15px; }
+
+    label { display: block; margin-top: 10px; font-size: 13px; font-weight: bold; }
+    input, select, textarea {
+      width: 100%; padding: 10px; margin-top: 5px;
+      border: 1px solid var(--border); border-radius: 9px; outline: none; font-size: 14px;
+    }
+    input:focus, select:focus, textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
+
+    button {
+      border: none; border-radius: 9px; padding: 10px 14px; cursor: pointer;
+      background: var(--primary); color: white; font-weight: bold; font-size: 14px;
+    }
+    button:hover { background: var(--primary-dark); }
+    button.secondary { background: #4b5563; }
+    button.secondary:hover { background: #374151; }
+    button.success { background: var(--success); }
+    button.warning { background: var(--warning); }
+    button.danger { background: var(--danger); }
+    button.small { padding: 7px 10px; font-size: 12px; margin-top: 0; }
+
+    .muted { color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 700px) { .grid-2 { grid-template-columns: 1fr; } }
+
+    .rule-item {
+      border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px;
+      background: #f9fafb; margin-top: 10px;
+    }
+    .rule-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; flex-wrap: wrap; }
+    .rule-title { font-weight: bold; font-size: 15px; }
+    .rule-code { font-family: monospace; font-size: 12px; color: var(--muted); }
+
+    .badge {
+      display: inline-block; padding: 3px 8px; border-radius: 999px;
+      font-size: 11px; font-weight: bold; margin-left: 6px;
+    }
+    .badge.active { background: #dcfce7; color: #166534; }
+    .badge.inactive { background: #fee2e2; color: #991b1b; }
+
+    .recipients-list { margin-top: 10px; display: grid; gap: 6px; }
+    .recipient-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 6px 10px; background: white; border: 1px solid #e5e7eb; border-radius: 8px;
+      font-size: 13px;
+    }
+
+    .alert { padding: 10px 12px; border-radius: 9px; margin-top: 14px; font-size: 13px; }
+    .alert.error { background: #fee2e2; color: #991b1b; }
+    .alert.success { background: #dcfce7; color: #166534; }
+    .alert.info { background: #dbeafe; color: #1e40af; }
+
+    .toggle-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+    .toggle-row input[type="checkbox"] { width: auto; margin: 0; }
+
+    details summary {
+      cursor: pointer; font-size: 13px; color: var(--primary); margin-top: 10px;
+    }
+    details[open] summary { margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Notificaciones</h1>
+    <a class="back-btn" href="/">← Volver al panel</a>
+  </header>
+
+  <main>
+
+    <section class="card">
+      <h2>Reglas de notificación</h2>
+      <p class="muted">
+        Cada regla asocia un <b>tipo de evento</b> con una <b>plantilla</b> y una lista de <b>destinatarios</b>. Cuando un evento se dispara, se manda el correo a todos los destinatarios activos respetando el throttling.
+      </p>
+
+      <div class="row">
+        <button class="secondary small" onclick="loadAll()">Actualizar lista</button>
+        <button class="success small" onclick="toggleNewForm()">+ Nueva regla</button>
+      </div>
+
+      <div id="newRuleForm" class="card" style="display:none; margin-top: 12px; background: #eef2ff;">
+        <h3>Crear regla nueva</h3>
+        <div class="grid-2">
+          <div>
+            <label>Tipo de evento (eventType)</label>
+            <input id="newEventType" placeholder="WHATSAPP_DISCONNECTED" />
+            <div class="muted">MAYÚSCULAS_CON_GUIONES_BAJOS.</div>
+          </div>
+          <div>
+            <label>Plantilla</label>
+            <select id="newTemplateCode"><option value="">Cargando...</option></select>
+          </div>
+        </div>
+
+        <label>Nombre</label>
+        <input id="newName" placeholder="Avisar cuando WhatsApp se desconecte" />
+
+        <label>Descripción</label>
+        <input id="newDescription" placeholder="Opcional" />
+
+        <div class="grid-2">
+          <div>
+            <label>Throttling (minutos)</label>
+            <input id="newThrottle" type="number" min="0" max="1440" value="0" />
+            <div class="muted">0 = sin throttling.</div>
+          </div>
+          <div style="display:flex; align-items:flex-end;">
+            <div class="toggle-row" style="margin-bottom: 5px;">
+              <input id="newActive" type="checkbox" checked />
+              <label for="newActive" style="margin: 0;">Activar regla</label>
+            </div>
+          </div>
+        </div>
+
+        <div class="row">
+          <button class="success" onclick="createRule()">Crear regla</button>
+          <button class="secondary" onclick="toggleNewForm()">Cancelar</button>
+        </div>
+
+        <div id="newRuleAlert" class="alert" style="display:none;"></div>
+      </div>
+
+      <div id="rulesList">
+        <div class="muted" style="margin-top: 10px;">Cargando...</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Disparar evento manualmente (pruebas)</h2>
+      <p class="muted">Útil para probar plantillas y destinatarios antes de enganchar el disparo automático.</p>
+
+      <label>Tipo de evento</label>
+      <select id="triggerEventType"><option value="">Selecciona una regla</option></select>
+
+      <label>Variables (JSON, opcional)</label>
+      <textarea id="triggerVariables" style="min-height: 100px; font-family: monospace; font-size: 12px;"
+        placeholder='{"username": "admin", "timestamp": "2026-01-01 10:00"}'></textarea>
+
+      <div class="row">
+        <button class="warning" onclick="triggerEvent()">Disparar evento</button>
+      </div>
+
+      <div id="triggerAlert" class="alert" style="display:none;"></div>
+    </section>
+
+  </main>
+
+<script>
+  let rules = [];
+  let templates = [];
+
+  async function request(path, options) {
+    options = options || {};
+    options.credentials = 'include';
+    const res = await fetch(path, options);
+    const text = await res.text();
+    let data;
+    try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+    if (res.status === 401) {
+      window.location.href = '/static/login.html';
+      throw data;
+    }
+    if (!res.ok) throw data;
+    return data;
+  }
+
+  function escapeHtml(value) {
+    return String(value == null ? '' : value)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#039;');
+  }
+
+  function showAlert(elId, type, msg) {
+    const el = document.getElementById(elId);
+    el.className = 'alert ' + type;
+    el.textContent = msg;
+    el.style.display = 'block';
+  }
+  function hideAlert(elId) {
+    document.getElementById(elId).style.display = 'none';
+  }
+
+  function renderTemplateOptions(selectId, currentValue) {
+    const sel = document.getElementById(selectId);
+    sel.innerHTML = templates.map(function(t) {
+      const selected = currentValue === t.code ? 'selected' : '';
+      return '<option value="' + escapeHtml(t.code) + '" ' + selected + '>' +
+        escapeHtml(t.code) + ' — ' + escapeHtml(t.name) + '</option>';
+    }).join('');
+  }
+
+  function renderEventTypeSelect() {
+    const sel = document.getElementById('triggerEventType');
+    if (!rules.length) {
+      sel.innerHTML = '<option value="">No hay reglas creadas</option>';
+      return;
+    }
+    sel.innerHTML = '<option value="">— Selecciona —</option>' + rules.map(function(r) {
+      return '<option value="' + escapeHtml(r.eventType) + '">' +
+        escapeHtml(r.eventType) + ' (' + escapeHtml(r.name) + ')</option>';
+    }).join('');
+  }
+
+  function renderRules() {
+    const container = document.getElementById('rulesList');
+    if (!rules.length) {
+      container.innerHTML = '<div class="muted" style="margin-top:10px;">No hay reglas. Crea una con el botón "+ Nueva regla".</div>';
+      return;
+    }
+    container.innerHTML = rules.map(function(r) {
+      const badge = r.active
+        ? '<span class="badge active">Activa</span>'
+        : '<span class="badge inactive">Inactiva</span>';
+      const last = r.lastTriggeredAt
+        ? new Date(r.lastTriggeredAt).toLocaleString()
+        : 'Nunca';
+
+      const recipientsHtml = r.recipients.length
+        ? r.recipients.map(function(rec) {
+            const recBadge = rec.active
+              ? '<span class="badge active">Activo</span>'
+              : '<span class="badge inactive">Inactivo</span>';
+            return '<div class="recipient-row">' +
+              '<div>' + escapeHtml(rec.email) + ' ' + recBadge + '</div>' +
+              '<div class="row" style="margin:0;">' +
+              '<button class="secondary small" onclick="toggleRecipient(\'' + r.id +
+                '\', \'' + rec.id + '\', ' + (!rec.active) + ')">' +
+                (rec.active ? 'Desactivar' : 'Activar') + '</button>' +
+              '<button class="danger small" onclick="removeRecipient(\'' + r.id +
+                '\', \'' + rec.id + '\')">Eliminar</button>' +
+              '</div></div>';
+          }).join('')
+        : '<div class="muted">No hay destinatarios.</div>';
+
+      const templateOptions = templates.map(function(t) {
+        const selected = r.templateCode === t.code ? 'selected' : '';
+        return '<option value="' + escapeHtml(t.code) + '" ' + selected + '>' +
+          escapeHtml(t.code) + '</option>';
+      }).join('');
+
+      return '' +
+      '<div class="rule-item">' +
+        '<div class="rule-header">' +
+          '<div>' +
+            '<div class="rule-title">' + escapeHtml(r.name) + ' ' + badge + '</div>' +
+            '<div class="rule-code">' + escapeHtml(r.eventType) + ' → plantilla ' + escapeHtml(r.templateCode) + '</div>' +
+            '<div class="muted">Throttling: ' + r.throttleMinutes + ' min · Último disparo: ' + escapeHtml(last) + '</div>' +
+          '</div>' +
+          '<div class="row" style="margin-top:0;">' +
+            '<button class="secondary small" onclick="toggleRule(\'' + r.id + '\', ' + (!r.active) + ')">' +
+              (r.active ? 'Desactivar' : 'Activar') + '</button>' +
+            '<button class="danger small" onclick="deleteRuleAction(\'' + r.id + '\')">Eliminar</button>' +
+          '</div>' +
+        '</div>' +
+
+        '<details>' +
+          '<summary>Configurar regla</summary>' +
+          '<div class="grid-2">' +
+            '<div>' +
+              '<label>Nombre</label>' +
+              '<input id="rule_name_' + r.id + '" value="' + escapeHtml(r.name) + '" />' +
+            '</div>' +
+            '<div>' +
+              '<label>Plantilla</label>' +
+              '<select id="rule_tpl_' + r.id + '">' + templateOptions + '</select>' +
+            '</div>' +
+          '</div>' +
+          '<label>Throttling (minutos)</label>' +
+          '<input id="rule_thr_' + r.id + '" type="number" min="0" max="1440" value="' + r.throttleMinutes + '" />' +
+          '<div class="row">' +
+            '<button class="success small" onclick="saveRuleEdit(\'' + r.id + '\')">Guardar cambios</button>' +
+          '</div>' +
+        '</details>' +
+
+        '<h3 style="margin-top:14px;">Destinatarios</h3>' +
+        '<div class="recipients-list">' + recipientsHtml + '</div>' +
+        '<div class="row">' +
+          '<input id="add_email_' + r.id + '" type="email" placeholder="nuevo@correo.com" style="flex:1; margin-top:0;" />' +
+          '<button class="success small" onclick="addRecipient(\'' + r.id + '\')">Agregar destinatario</button>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  }
+
+  async function loadAll() {
+    try {
+      const [rulesData, tplData] = await Promise.all([
+        request('/api/notifications/rules'),
+        request('/api/templates')
+      ]);
+      rules = rulesData.rules || [];
+      templates = (tplData.templates || []).filter(function(t) { return t.active; });
+      renderRules();
+      renderTemplateOptions('newTemplateCode', '');
+      renderEventTypeSelect();
+    } catch (e) {
+      document.getElementById('rulesList').innerHTML =
+        '<div class="alert error" style="display:block;">' +
+        ((e && e.message) || 'Error cargando.') + '</div>';
+    }
+  }
+
+  function toggleNewForm() {
+    const f = document.getElementById('newRuleForm');
+    f.style.display = f.style.display === 'none' ? 'block' : 'none';
+    if (f.style.display === 'block') {
+      document.getElementById('newEventType').value = '';
+      document.getElementById('newName').value = '';
+      document.getElementById('newDescription').value = '';
+      document.getElementById('newThrottle').value = '0';
+      document.getElementById('newActive').checked = true;
+      hideAlert('newRuleAlert');
+    }
+  }
+
+  async function createRule() {
+    hideAlert('newRuleAlert');
+    const eventType = document.getElementById('newEventType').value.trim().toUpperCase();
+    const name = document.getElementById('newName').value.trim();
+    const description = document.getElementById('newDescription').value.trim();
+    const templateCode = document.getElementById('newTemplateCode').value;
+    const throttleMinutes = parseInt(document.getElementById('newThrottle').value, 10) || 0;
+    const active = document.getElementById('newActive').checked;
+
+    if (!eventType || !/^[A-Z0-9_]+$/.test(eventType)) {
+      showAlert('newRuleAlert', 'error', 'eventType inválido.');
+      return;
+    }
+    if (!name || !templateCode) {
+      showAlert('newRuleAlert', 'error', 'Nombre y plantilla son obligatorios.');
+      return;
+    }
+    try {
+      await request('/api/notifications/rules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ eventType, name, description: description || null, templateCode, throttleMinutes, active })
+      });
+      toggleNewForm();
+      await loadAll();
+    } catch (e) {
+      showAlert('newRuleAlert', 'error', (e && e.message) || 'No se pudo crear.');
+    }
+  }
+
+  async function toggleRule(id, active) {
+    try {
+      await request('/api/notifications/rules/' + encodeURIComponent(id), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ active })
+      });
+      await loadAll();
+    } catch (e) {
+      alert((e && e.message) || 'Error');
+    }
+  }
+
+  async function deleteRuleAction(id) {
+    if (!confirm('¿Eliminar esta regla y todos sus destinatarios?')) return;
+    try {
+      await request('/api/notifications/rules/' + encodeURIComponent(id), { method: 'DELETE' });
+      await loadAll();
+    } catch (e) {
+      alert((e && e.message) || 'Error');
+    }
+  }
+
+  async function saveRuleEdit(id) {
+    const name = document.getElementById('rule_name_' + id).value.trim();
+    const templateCode = document.getElementById('rule_tpl_' + id).value;
+    const throttleMinutes = parseInt(document.getElementById('rule_thr_' + id).value, 10) || 0;
+    try {
+      await request('/api/notifications/rules/' + encodeURIComponent(id), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, templateCode, throttleMinutes })
+      });
+      await loadAll();
+    } catch (e) {
+      alert((e && e.message) || 'Error');
+    }
+  }
+
+  async function addRecipient(ruleId) {
+    const inp = document.getElementById('add_email_' + ruleId);
+    const email = inp.value.trim();
+    if (!email) return;
+    try {
+      await request('/api/notifications/rules/' + encodeURIComponent(ruleId) + '/recipients', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      });
+      inp.value = '';
+      await loadAll();
+    } catch (e) {
+      alert((e && e.message) || 'Error');
+    }
+  }
+
+  async function toggleRecipient(ruleId, recipientId, active) {
+    try {
+      await request('/api/notifications/rules/' + encodeURIComponent(ruleId) +
+        '/recipients/' + encodeURIComponent(recipientId), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ active })
+      });
+      await loadAll();
+    } catch (e) {
+      alert((e && e.message) || 'Error');
+    }
+  }
+
+  async function removeRecipient(ruleId, recipientId) {
+    if (!confirm('¿Eliminar este destinatario?')) return;
+    try {
+      await request('/api/notifications/rules/' + encodeURIComponent(ruleId) +
+        '/recipients/' + encodeURIComponent(recipientId), { method: 'DELETE' });
+      await loadAll();
+    } catch (e) {
+      alert((e && e.message) || 'Error');
+    }
+  }
+
+  async function triggerEvent() {
+    hideAlert('triggerAlert');
+    const eventType = document.getElementById('triggerEventType').value;
+    const varsText = document.getElementById('triggerVariables').value.trim();
+
+    if (!eventType) {
+      showAlert('triggerAlert', 'error', 'Selecciona un tipo de evento.');
+      return;
+    }
+    let variables = {};
+    if (varsText) {
+      try {
+        variables = JSON.parse(varsText);
+      } catch (e) {
+        showAlert('triggerAlert', 'error', 'JSON inválido en variables.');
+        return;
+      }
+    }
+    try {
+      const data = await request('/api/notifications/trigger', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ eventType, variables })
+      });
+      if (data.ok) {
+        showAlert('triggerAlert', 'success',
+          (data.message || 'Disparado.') + ' Destinatarios: ' + (data.sentTo || []).join(', '));
+      } else {
+        showAlert('triggerAlert', 'info',
+          'Resultado: ' + data.code + ' — ' + (data.message || ''));
+      }
+      await loadAll();
+    } catch (e) {
+      showAlert('triggerAlert', 'error', (e && e.message) || 'Error.');
+    }
+  }
+
+  loadAll();
+</script>
+</body>
+</html>

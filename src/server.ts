@@ -17,12 +17,17 @@ import {
   ensureSessionSecret,
   ensureEncryptionKey,
 } from './services/session.service.js';
+import { seedSystemTemplates } from './services/templates.service.js';
 import { registerStatusRoutes } from './routes/status.routes.js';
 import { registerConfigRoutes } from './routes/config.routes.js';
 import { registerAuthRoutes } from './routes/auth.routes.js';
 import { registerMessageRoutes } from './routes/messages.routes.js';
 import { registerUiRoutes } from './routes/ui.routes.js';
 import { registerSessionRoutes } from './routes/session.routes.js';
+import { registerSmtpRoutes } from './routes/smtp.routes.js';
+import { registerTemplatesRoutes } from './routes/templates.routes.js';
+import { registerNotificationsRoutes } from './routes/notifications.routes.js';
+import { registerPasswordResetRoutes } from './routes/password-reset.routes.js';
 import { whatsapp } from './services/baileys.service.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -32,6 +37,7 @@ async function main() {
   await ensureDefaultConfig();
   const sessionSecret = await ensureSessionSecret();
   await ensureEncryptionKey();
+  await seedSystemTemplates();
 
   const host = (await getConfigValue('HOST')) || '0.0.0.0';
   const port = (await getNumberConfig('PORT')) || 3105;
@@ -73,6 +79,10 @@ async function main() {
   }));
 
   await registerSessionRoutes(app);
+  await registerPasswordResetRoutes(app);
+  await registerSmtpRoutes(app);
+  await registerTemplatesRoutes(app);
+  await registerNotificationsRoutes(app);
   await registerStatusRoutes(app);
   await registerConfigRoutes(app);
   await registerAuthRoutes(app);

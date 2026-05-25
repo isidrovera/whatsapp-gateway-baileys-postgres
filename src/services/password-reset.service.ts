@@ -3,10 +3,8 @@ import { prisma } from '../db/prisma.js';
 import { logger } from '../utils/logger.js';
 import { hashPassword, revokeAllUserSessions } from './session.service.js';
 import { getConfigValue } from './config.service.js';
-import { triggerEvent } from './notifications.service.js';
-import { sendEmail } from './email.service.js';
+import { sendEmail, renderTemplate } from './email.service.js';
 import { getTemplateByCode } from './templates.service.js';
-import { renderTemplate } from './email.service.js';
 
 const TOKEN_TTL_MINUTES = 60;
 
@@ -21,8 +19,18 @@ function generateRawToken(): string {
 export async function requestPasswordReset(
   identifier: string
 ): Promise<{ ok: true; message: string }> {
-  const cleanIdentifier = identifier.trim().toLowerCase();
-  const cleanIdentifierExact = identifier.trim();
+  const cleanIdentifier = String(identifier || '').trim().toLowerCase();
+  const cleanIdentifierExact = String(identifier || '').trim();
+
+  const genericResponse = {
+    ok: true as const,
+    message:
+      'Si la cuenta existe y tiene email configurado, recibirás un enlace para restablecer la contraseña.',
+  };
+
+  if (!cleanIdentifierExact) {
+    return genericResponse;
+  }
 
   const user = await prisma.user.findFirst({
     where: {
@@ -34,19 +42,19 @@ export async function requestPasswordReset(
     },
   });
 
-  const genericResponse = {
-    ok: true as const,
-    message:
-      'Si la cuenta existe y tiene email configurado, recibirás un enlace para restablecer la contraseña.',
-  };
-
   if (!user) {
-    logger.info({ identifier: cleanIdentifier }, 'Solicitud de reset para usuario inexistente');
+    logger.info(
+      { identifier: cleanIdentifier },
+      'Solicitud de reset para usuario inexistente'
+    );
     return genericResponse;
   }
 
   if (!user.email) {
-    logger.info({ userId: user.id }, 'Usuario sin email configurado, no se envía reset');
+    logger.info(
+      { userId: user.id },
+      'Usuario sin email configurado, no se envía reset'
+    );
     return genericResponse;
   }
 
@@ -63,7 +71,7 @@ export async function requestPasswordReset(
   });
 
   const publicBaseUrl = await getConfigValue('PUBLIC_BASE_URL');
-  const baseUrl = publicBaseUrl || '';
+  const baseUrl = String(publicBaseUrl || '').replace(/\/$/, '');
   const resetUrl = `${baseUrl}/static/reset.html?token=${rawToken}`;
 
   const template = await getTemplateByCode('PASSWORD_RESET');
@@ -96,11 +104,21 @@ export async function requestPasswordReset(
 
   if (!sendResult.ok) {
     logger.warn(
-      { userId: user.id, code: sendResult.code, message: sendResult.message },
+      {
+        userId: user.id,
+        code: sendResult.code,
+        message: sendResult.message,
+      },
       'No se pudo enviar email de reset'
     );
   } else {
-    logger.info({ userId: user.id, logId: sendResult.logId }, 'Email de reset enviado');
+    logger.info(
+      {
+        userId: user.id,
+        logId: sendResult.logId,
+      },
+      'Email de reset enviado'
+    );
   }
 
   return genericResponse;
@@ -172,7 +190,7 @@ export async function validateResetToken(
 export async function consumeResetToken(
   rawToken: string,
   newPassword: string
-): Promise
+): Promise<
   | { ok: true; message: string }
   | { ok: false; code: string; message: string }
 > {
@@ -214,11 +232,15 @@ export async function consumeResetToken(
 
   await revokeAllUserSessions(validation.userId!);
 
-  logger.info({ userId: validation.userId }, 'Contraseña restablecida vía token');
+  logger.info(
+    { userId: validation.userId },
+    'Contraseña restablecida vía token'
+  );
 
   return {
     ok: true,
-    message: 'Contraseña restablecida correctamente. Inicia sesión con tu nueva contraseña.',
+    message:
+      'Contraseña restablecida correctamente. Inicia sesión con tu nueva contraseña.',
   };
 }
 
@@ -233,7 +255,10 @@ export async function cleanupExpiredResetTokens(): Promise<number> {
   });
 
   if (result.count > 0) {
-    logger.info({ count: result.count }, 'Tokens de reset expirados eliminados');
+    logger.info(
+      { count: result.count },
+      'Tokens de reset expirados eliminados'
+    );
   }
 
   return result.count;

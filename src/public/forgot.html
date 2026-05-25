@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>Recuperar contraseña · WhatsApp Gateway</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #f4f6fb;
+      --card: #ffffff;
+      --primary: #2563eb;
+      --primary-dark: #1d4ed8;
+      --success: #059669;
+      --danger: #dc2626;
+      --warning: #d97706;
+      --dark: #111827;
+      --muted: #6b7280;
+      --border: #d1d5db;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: Arial, sans-serif;
+      background: var(--bg);
+      margin: 0;
+      color: #1f2937;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .card {
+      background: var(--card);
+      border-radius: 14px;
+      padding: 28px;
+      box-shadow: 0 4px 18px rgba(0,0,0,.10);
+      border: 1px solid #e5e7eb;
+      width: 100%;
+      max-width: 420px;
+    }
+    h1 { margin: 0 0 6px; font-size: 22px; color: var(--dark); }
+    .subtitle { margin: 0 0 18px; color: var(--muted); font-size: 14px; line-height: 1.45; }
+    label { display: block; margin-top: 12px; font-size: 13px; font-weight: bold; }
+    input {
+      width: 100%; padding: 10px; margin-top: 5px; border: 1px solid var(--border);
+      border-radius: 9px; outline: none; font-size: 14px;
+    }
+    input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
+    button {
+      border: none; border-radius: 9px; padding: 11px 14px; margin-top: 18px;
+      cursor: pointer; background: var(--primary); color: white; font-weight: bold;
+      font-size: 14px; width: 100%;
+    }
+    button:hover { background: var(--primary-dark); }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .alert {
+      padding: 10px 12px; border-radius: 9px; margin-top: 14px;
+      font-size: 13px; display: none;
+    }
+    .alert.error { background: #fee2e2; color: #991b1b; }
+    .alert.success { background: #dcfce7; color: #166534; }
+    .pill {
+      display: inline-block; padding: 4px 10px; border-radius: 999px;
+      background: #eef2ff; color: #3730a3; font-weight: bold; font-size: 12px; margin-bottom: 12px;
+    }
+    .links {
+      margin-top: 14px;
+      text-align: center;
+      font-size: 13px;
+    }
+    .links a {
+      color: var(--primary);
+      text-decoration: none;
+    }
+    .links a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <span class="pill">Recuperar acceso</span>
+    <h1>¿Olvidaste tu contraseña?</h1>
+    <p class="subtitle">
+      Ingresa tu usuario o email registrado. Si la cuenta existe y tiene email configurado, recibirás un enlace para restablecer la contraseña.
+    </p>
+
+    <label for="identifier">Usuario o email</label>
+    <input id="identifier" type="text" placeholder="admin o tu@correo.com" autocomplete="username" />
+
+    <button id="submitBtn" onclick="submitForgot()">Enviar enlace</button>
+
+    <div id="alert" class="alert"></div>
+
+    <div class="links">
+      <a href="/static/login.html">← Volver al inicio de sesión</a>
+    </div>
+  </div>
+
+<script>
+  function showAlert(type, message) {
+    const el = document.getElementById('alert');
+    el.className = 'alert ' + type;
+    el.textContent = message;
+    el.style.display = 'block';
+  }
+  function hideAlert() { document.getElementById('alert').style.display = 'none'; }
+
+  async function submitForgot() {
+    hideAlert();
+    const identifier = document.getElementById('identifier').value.trim();
+    if (!identifier) {
+      showAlert('error', 'Ingresa tu usuario o email.');
+      return;
+    }
+
+    const btn = document.getElementById('submitBtn');
+    btn.disabled = true;
+    btn.textContent = 'Enviando...';
+
+    try {
+      const res = await fetch('/api/password-reset/request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier })
+      });
+      const data = await res.json();
+      showAlert('success', data.message || 'Solicitud procesada. Revisa tu email.');
+    } catch (e) {
+      showAlert('error', 'Error de red. Revisa la conexión.');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Enviar enlace';
+    }
+  }
+
+  document.addEventListener('keydown', function(ev) {
+    if (ev.key === 'Enter') submitForgot();
+  });
+</script>
+</body>
+</html>

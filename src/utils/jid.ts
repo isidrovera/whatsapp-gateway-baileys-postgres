@@ -1,5 +1,5 @@
 export function isGroupJid(jid?: string | null): boolean {
-  return !!jid && String(jid).endsWith('@g.us');
+  return !!jid && String(jid).trim().endsWith('@g.us');
 }
 
 export function isLidJid(jid?: string | null): boolean {
@@ -9,7 +9,10 @@ export function isLidJid(jid?: string | null): boolean {
 
 export function isPnJid(jid?: string | null): boolean {
   const value = String(jid || '').trim().toLowerCase();
-  return !!value && (value.includes('@s.whatsapp.net') || value.includes('@c.us'));
+  return !!value && (
+    value.includes('@s.whatsapp.net') ||
+    value.includes('@c.us')
+  );
 }
 
 export function cleanPhone(value?: string | null): string {
@@ -51,46 +54,44 @@ export function jidFromTo(to: string): string {
   return `${digits}@s.whatsapp.net`;
 }
 
-function firstNonEmpty(...values: any[]): string {
-  for (const value of values) {
-    const text = String(value || '').trim();
-    if (text) return text;
-  }
-  return '';
+function addCandidate(list: string[], value?: string | null) {
+  const item = String(value || '').trim();
+
+  if (!item) return;
+  if (list.includes(item)) return;
+
+  list.push(item);
 }
 
 function collectCandidateJids(remoteJid: string, key?: any): string[] {
-  const candidates = [
-    remoteJid,
+  const candidates: string[] = [];
 
-    key?.remoteJid,
-    key?.participant,
-    key?.remoteJidAlt,
-    key?.participantAlt,
+  addCandidate(candidates, remoteJid);
 
-    key?.chat,
-    key?.from,
-    key?.sender,
-    key?.author,
-    key?.idRemoteJid,
-    key?.recipientJid,
-    key?.participantPn,
-    key?.remoteJidPn,
-  ];
+  addCandidate(candidates, key?.remoteJid);
+  addCandidate(candidates, key?.participant);
 
-  const unique: string[] = [];
+  // Campos alternativos de Baileys / WhatsApp multi-device.
+  addCandidate(candidates, key?.remoteJidAlt);
+  addCandidate(candidates, key?.participantAlt);
 
-  for (const item of candidates) {
-    const value = String(item || '').trim();
+  // IMPORTANTE:
+  // En tus logs el número normal llegó aquí:
+  // senderPn: "51924894829@s.whatsapp.net"
+  addCandidate(candidates, key?.senderPn);
 
-    if (!value) continue;
+  // Otros posibles nombres según evento/versión.
+  addCandidate(candidates, key?.participantPn);
+  addCandidate(candidates, key?.remoteJidPn);
+  addCandidate(candidates, key?.senderJid);
+  addCandidate(candidates, key?.sender);
+  addCandidate(candidates, key?.author);
+  addCandidate(candidates, key?.from);
+  addCandidate(candidates, key?.chat);
+  addCandidate(candidates, key?.idRemoteJid);
+  addCandidate(candidates, key?.recipientJid);
 
-    if (!unique.includes(value)) {
-      unique.push(value);
-    }
-  }
-
-  return unique;
+  return candidates;
 }
 
 export function extractIdentifiers(remoteJid: string, key?: any) {
@@ -102,13 +103,13 @@ export function extractIdentifiers(remoteJid: string, key?: any) {
   let alt_jid = '';
 
   for (const candidate of candidates) {
-    if (isPnJid(candidate) && !jid) {
+    if (!jid && isPnJid(candidate)) {
       jid = candidate;
       phone = cleanPhone(candidate);
       continue;
     }
 
-    if (isLidJid(candidate) && !lid) {
+    if (!lid && isLidJid(candidate)) {
       lid = candidate;
       continue;
     }
@@ -121,13 +122,11 @@ export function extractIdentifiers(remoteJid: string, key?: any) {
     }
   }
 
-  // Si remoteJid es número normal, priorizarlo como jid.
   if (isPnJid(remoteJid)) {
     jid = remoteJid;
     phone = cleanPhone(remoteJid);
   }
 
-  // Si remoteJid es LID, mantenerlo como lid/raw.
   if (isLidJid(remoteJid)) {
     lid = remoteJid;
   }
@@ -136,7 +135,7 @@ export function extractIdentifiers(remoteJid: string, key?: any) {
     phone,
     jid,
     lid,
-    raw_jid: remoteJid || firstNonEmpty(jid, lid),
+    raw_jid: remoteJid || jid || lid || '',
     alt_jid,
     candidates,
   };
