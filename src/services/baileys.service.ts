@@ -39,6 +39,7 @@ class WhatsAppGateway {
   private qrDataURL: string | null = null;
   private startTime = Date.now();
   private botSentMessageIds = new Map<string, number>();
+  private messageCache = new Map<string, { message: proto.IMessage; expiresAt: number }>();
   private reconnectTimer: NodeJS.Timeout | null = null;
   private retryCount = 0;
 
@@ -76,6 +77,91 @@ class WhatsAppGateway {
     }
 
     return true;
+  }
+
+  private cacheMessage(id?: string | null, message?: proto.IMessage | null) {
+    if (!id || !message) return;
+
+    this.messageCache.set(id, {
+      message,
+      expiresAt: Date.now() + 30 * 60 * 1000,
+    });
+
+    if (this.messageCache.size > 1000) {
+      this.cleanupMessageCache();
+    }
+  }
+
+  private cleanupMessageCache() {
+    const now = Date.now();
+
+    for (const [id, item] of this.messageCache.entries()) {
+      if (item.expiresAt <= now) {
+        this.messageCache.delete(id);
+      }
+    }
+
+    if (this.messageCache.size > 1000) {
+      const excess = this.messageCache.size - 1000;
+      const ids = Array.from(this.messageCache.keys()).slice(0, excess);
+
+      for (const id of ids) {
+        this.messageCache.delete(id);
+      }
+    }
+  }
+
+  private async getMessageForRetry(key: any): Promise<proto.IMessage | undefined> {
+    try {
+      const messageId = key?.id || '';
+
+      if (!messageId) {
+        return undefined;
+      }
+
+      const cached = this.messageCache.get(messageId);
+
+      if (cached) {
+        if (cached.expiresAt > Date.now()) {
+          return cached.message;
+        }
+
+        this.messageCache.delete(messageId);
+      }
+
+      const logged = await prisma.messageLog.findFirst({
+        where: {
+          externalMessageId: messageId,
+        },
+        orderBy: {
+          createdAt: 'desc',
+        },
+      });
+
+      if (!logged?.content) {
+        logger.debug({ messageId }, '[WA] getMessage sin registro local');
+        return undefined;
+      }
+
+      if (logged.messageType === 'text') {
+        return {
+          conversation: logged.content,
+        };
+      }
+
+      logger.debug(
+        {
+          messageId,
+          messageType: logged.messageType,
+        },
+        '[WA] getMessage encontrado pero no reconstruible como texto'
+      );
+
+      return undefined;
+    } catch (err) {
+      logger.warn({ err, key }, '[WA] error en getMessageForRetry');
+      return undefined;
+    }
   }
 
   private async getAuthDir() {
@@ -184,12 +270,26 @@ class WhatsAppGateway {
       logger: logger as any,
       browser: Browsers.macOS('Google Chrome'),
       printQRInTerminal: false,
-      markOnlineOnConnect: false,
+
+      /*
+       * Se mantiene sin sincronizar historial completo para no alterar tu lógica.
+       * Solo se mejora la sesión activa y la recuperación de mensajes para retry.
+       */
+      markOnlineOnConnect: true,
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
-      getMessage: async () => undefined,
+
+      /*
+       * Antes devolvía siempre undefined.
+       * Esto ayuda a Baileys cuando WhatsApp pide reintento/contexto de mensaje.
+       */
+      getMessage: async (key: any) => {
+        return this.getMessageForRetry(key);
+      },
+
       connectTimeoutMs: 60000,
-      keepAliveIntervalMs: 15000,
+      keepAliveIntervalMs: 10000,
+      defaultQueryTimeoutMs: 60000,
     });
 
     this.sock.ev.on('creds.update', saveCreds);
@@ -255,6 +355,15 @@ class WhatsAppGateway {
         {
           type,
           count: messages?.length || 0,
+          messages: (messages || []).map((m) => ({
+            id: m.key?.id,
+            remoteJid: m.key?.remoteJid,
+            participant: m.key?.participant,
+            fromMe: m.key?.fromMe,
+            hasMessage: !!m.message,
+            keys: m.message ? Object.keys(m.message as any) : [],
+            stubType: (m as any).messageStubType,
+          })),
         },
         '[WA-IN] messages.upsert recibido'
       );
@@ -265,6 +374,7 @@ class WhatsAppGateway {
       }
 
       for (const msg of messages || []) {
+        this.cacheMessage(msg.key?.id, msg.message);
         await this.handleIncomingMessage(msg);
       }
     });
@@ -338,6 +448,7 @@ class WhatsAppGateway {
     });
 
     this.markBotMessageId(resp?.key?.id);
+    this.cacheMessage(resp?.key?.id, resp?.message);
 
     await prisma.messageLog.create({
       data: {
@@ -418,6 +529,7 @@ class WhatsAppGateway {
     }
 
     this.markBotMessageId(resp?.key?.id);
+    this.cacheMessage(resp?.key?.id, resp?.message);
 
     await prisma.messageLog.create({
       data: {
@@ -518,6 +630,8 @@ class WhatsAppGateway {
     const remoteJid = this.getRemoteJid(message);
 
     try {
+      this.cacheMessage(messageId, message.message);
+
       logger.info(
         {
           messageId,
