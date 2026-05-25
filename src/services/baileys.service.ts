@@ -15,7 +15,15 @@ import { Boom } from '@hapi/boom';
 
 import { prisma } from '../db/prisma.js';
 import { logger } from '../utils/logger.js';
-import { extractIdentifiers, isGroupJid, jidFromTo } from '../utils/jid.js';
+import {
+  cleanPhone,
+  extractIdentifiers,
+  isGroupJid,
+  isLidJid,
+  isPnJid,
+  jidFromTo,
+  normalizeLidJid,
+} from '../utils/jid.js';
 import {
   extractText,
   getFileName,
@@ -212,8 +220,15 @@ class WhatsAppGateway {
     }
 
     if (raw.protocolMessage) return true;
-    if (raw.senderKeyDistributionMessage) return true;
-    if (raw.messageContextInfo && Object.keys(raw).length === 1) return true;
+
+    /*
+     * senderKeyDistributionMessage puede venir junto con conversation en grupos.
+     * Si viene solo, es interno; si viene con texto, se deja procesar.
+     */
+    const keys = Object.keys(raw);
+    if (raw.senderKeyDistributionMessage && keys.length === 1) return true;
+
+    if (raw.messageContextInfo && keys.length === 1) return true;
 
     if ((message as any).messageStubType) {
       return true;
@@ -242,6 +257,135 @@ class WhatsAppGateway {
     return raw * 1000;
   }
 
+  private normalizePhoneCandidate(value?: string | null): string {
+    const raw = String(value || '').trim();
+
+    if (!raw) return '';
+    if (isLidJid(raw)) return '';
+
+    const digits = cleanPhone(raw);
+
+    if (!digits) return '';
+
+    return digits;
+  }
+
+  private async resolvePhoneFromLid(
+    lidJid?: string | null,
+    key?: any
+  ): Promise<{ phone: string; jid: string; source: string } | null> {
+    try {
+      const lid = normalizeLidJid(lidJid) || String(lidJid || '').trim();
+
+      if (!lid || !isLidJid(lid)) {
+        return null;
+      }
+
+      const possibleAltValues = [
+        key?.remoteJidAlt,
+        key?.participantAlt,
+        key?.senderPn,
+        key?.participantPn,
+        key?.remoteJidPn,
+        key?.chatPn,
+        key?.authorPn,
+      ];
+
+      for (const item of possibleAltValues) {
+        if (item && isPnJid(item)) {
+          const phone = this.normalizePhoneCandidate(item);
+
+          if (phone) {
+            return {
+              phone,
+              jid: `${phone}@s.whatsapp.net`,
+              source: 'message_key_alt',
+            };
+          }
+        }
+      }
+
+      const repo = (this.sock as any)?.signalRepository;
+      const lidMapping = repo?.lidMapping;
+
+      if (!lidMapping || typeof lidMapping.getPNForLID !== 'function') {
+        logger.debug({ lid }, '[LID] lidMapping no disponible');
+        return null;
+      }
+
+      const result = await lidMapping.getPNForLID(lid);
+
+      if (!result) {
+        logger.debug({ lid }, '[LID] sin resultado getPNForLID');
+        return null;
+      }
+
+      const value =
+        typeof result === 'string'
+          ? result
+          : result?.jid || result?.pn || result?.phoneNumber || '';
+
+      const phone = this.normalizePhoneCandidate(value);
+
+      if (!phone) {
+        logger.debug({ lid, result }, '[LID] getPNForLID devolvió valor no usable');
+        return null;
+      }
+
+      return {
+        phone,
+        jid: `${phone}@s.whatsapp.net`,
+        source: 'signalRepository.lidMapping',
+      };
+    } catch (err) {
+      logger.warn({ err, lidJid }, '[LID] error resolviendo LID');
+      return null;
+    }
+  }
+
+  private async completeIdentifiersFromBaileys(
+    ids: ReturnType<typeof extractIdentifiers>,
+    key?: any
+  ) {
+    if (ids.phone || !ids.lid) {
+      return ids;
+    }
+
+    const resolved = await this.resolvePhoneFromLid(ids.lid, key);
+
+    if (!resolved) {
+      logger.info(
+        {
+          lid: ids.lid,
+          raw_jid: ids.raw_jid,
+          candidates: ids.candidates,
+        },
+        '[LID] no se pudo completar teléfono; se enviará solo LID'
+      );
+
+      return ids;
+    }
+
+    ids.phone = resolved.phone;
+    ids.jid = resolved.jid;
+
+    if (!ids.alt_jid) {
+      ids.alt_jid = resolved.jid;
+    }
+
+    logger.info(
+      {
+        lid: ids.lid,
+        phone: ids.phone,
+        jid: ids.jid,
+        source: resolved.source,
+      },
+      '[LID] teléfono completado'
+    );
+
+    return ids;
+  }
+
   async initialize(forceNew = false) {
     const authDir = await this.getAuthDir();
 
@@ -268,20 +412,20 @@ class WhatsAppGateway {
         keys: makeCacheableSignalKeyStore(state.keys, logger as any),
       },
       logger: logger as any,
-      browser: Browsers.macOS('Google Chrome'),
-      printQRInTerminal: false,
 
       /*
-       * Se mantiene sin sincronizar historial completo para no alterar tu lógica.
-       * Solo se mejora la sesión activa y la recuperación de mensajes para retry.
+       * Mantiene Baileys como cliente liviano, pero con fingerprint más estable
+       * para VPS/Linux.
        */
+      browser: Browsers.ubuntu('Chrome'),
+
+      printQRInTerminal: false,
       markOnlineOnConnect: true,
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
 
       /*
-       * Antes devolvía siempre undefined.
-       * Esto ayuda a Baileys cuando WhatsApp pide reintento/contexto de mensaje.
+       * Ayuda en reintentos/contexto de mensajes.
        */
       getMessage: async (key: any) => {
         return this.getMessageForRetry(key);
@@ -359,6 +503,11 @@ class WhatsAppGateway {
             id: m.key?.id,
             remoteJid: m.key?.remoteJid,
             participant: m.key?.participant,
+            remoteJidAlt: (m.key as any)?.remoteJidAlt,
+            participantAlt: (m.key as any)?.participantAlt,
+            senderPn: (m.key as any)?.senderPn,
+            participantPn: (m.key as any)?.participantPn,
+            remoteJidPn: (m.key as any)?.remoteJidPn,
             fromMe: m.key?.fromMe,
             hasMessage: !!m.message,
             keys: m.message ? Object.keys(m.message as any) : [],
@@ -368,6 +517,10 @@ class WhatsAppGateway {
         '[WA-IN] messages.upsert recibido'
       );
 
+      /*
+       * Tu lógica real procesa notify.
+       * append/replace solo se registran para diagnóstico y evitar duplicados.
+       */
       if (type !== 'notify') {
         logger.debug({ type }, '[WA-IN] upsert ignorado por tipo');
         return;
@@ -454,8 +607,9 @@ class WhatsAppGateway {
       data: {
         direction: 'out',
         chatType: isGroupJid(jid) ? 'group' : 'private',
-        phone: jid.includes('@') ? jid.split('@')[0] : to,
-        jid,
+        phone: isLidJid(jid) ? null : cleanPhone(jid) || to,
+        jid: isLidJid(jid) ? null : jid,
+        lid: isLidJid(jid) ? jid : null,
         rawJid: jid,
         messageType: 'text',
         content: message,
@@ -535,8 +689,9 @@ class WhatsAppGateway {
       data: {
         direction: 'out',
         chatType: isGroupJid(jid) ? 'group' : 'private',
-        phone: jid.includes('@') ? jid.split('@')[0] : params.to,
-        jid,
+        phone: isLidJid(jid) ? null : cleanPhone(jid) || params.to,
+        jid: isLidJid(jid) ? null : jid,
+        lid: isLidJid(jid) ? jid : null,
         rawJid: jid,
         messageType: params.media_type,
         content: params.caption || '',
@@ -638,6 +793,11 @@ class WhatsAppGateway {
           remoteJid,
           fromMe: message.key?.fromMe || false,
           participant: message.key?.participant || '',
+          remoteJidAlt: (message.key as any)?.remoteJidAlt,
+          participantAlt: (message.key as any)?.participantAlt,
+          senderPn: (message.key as any)?.senderPn,
+          participantPn: (message.key as any)?.participantPn,
+          remoteJidPn: (message.key as any)?.remoteJidPn,
           hasMessage: !!message.message,
           keys: message.message ? Object.keys(message.message as any) : [],
         },
@@ -654,6 +814,10 @@ class WhatsAppGateway {
         return;
       }
 
+      /*
+       * Se mantiene tu lógica: no procesar mensajes propios para evitar loop.
+       * Solo se loguean mejor arriba.
+       */
       if (message.key?.fromMe) {
         logger.info({ messageId, remoteJid }, '[WA-IN] mensaje propio ignorado');
         return;
@@ -687,7 +851,8 @@ class WhatsAppGateway {
         }
       }
 
-      const ids = extractIdentifiers(remoteJid, message.key);
+      const rawIds = extractIdentifiers(remoteJid, message.key);
+      const ids = await this.completeIdentifiersFromBaileys(rawIds, message.key);
 
       logger.info(
         {
@@ -757,6 +922,8 @@ class WhatsAppGateway {
         {
           messageId,
           phone: ids.phone,
+          jid: ids.jid,
+          lid: ids.lid,
           message: finalText,
         },
         '[WA-IN] enviando a webhook n8n'
@@ -787,6 +954,11 @@ class WhatsAppGateway {
         return;
       }
 
+      /*
+       * Se responde al mismo remoteJid que llegó.
+       * Si llegó por @lid, se responde por @lid.
+       * Si llegó por número, se responde por @s.whatsapp.net.
+       */
       const sent = await this.sendText(remoteJid, responseText);
 
       logger.info(

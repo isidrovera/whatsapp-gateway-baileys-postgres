@@ -1,5 +1,5 @@
 export function isGroupJid(jid?: string | null): boolean {
-  return !!jid && String(jid).trim().endsWith('@g.us');
+  return !!jid && String(jid).trim().toLowerCase().endsWith('@g.us');
 }
 
 export function isLidJid(jid?: string | null): boolean {
@@ -9,10 +9,29 @@ export function isLidJid(jid?: string | null): boolean {
 
 export function isPnJid(jid?: string | null): boolean {
   const value = String(jid || '').trim().toLowerCase();
+
   return !!value && (
     value.includes('@s.whatsapp.net') ||
     value.includes('@c.us')
   );
+}
+
+export function normalizeLidJid(jid?: string | null): string {
+  const value = String(jid || '').trim();
+
+  if (!value) return '';
+
+  if (value.toLowerCase().includes('@lid')) {
+    const left = value.split('@')[0].replace(/\D+/g, '');
+    return left ? `${left}@lid` : value;
+  }
+
+  if (value.toLowerCase().endsWith('.lid')) {
+    const left = value.replace(/\.lid$/i, '').replace(/\D+/g, '');
+    return left ? `${left}@lid` : value;
+  }
+
+  return '';
 }
 
 export function cleanPhone(value?: string | null): string {
@@ -27,6 +46,7 @@ export function cleanPhone(value?: string | null): string {
 
   let digits = input.replace(/\D+/g, '').replace(/^0+/, '');
 
+  // Perú: si llega 9 dígitos, agregar 51.
   if (digits.length === 9) {
     digits = `51${digits}`;
   }
@@ -75,14 +95,14 @@ function collectCandidateJids(remoteJid: string, key?: any): string[] {
   addCandidate(candidates, key?.remoteJidAlt);
   addCandidate(candidates, key?.participantAlt);
 
-  // IMPORTANTE:
-  // En tus logs el número normal llegó aquí:
-  // senderPn: "51924894829@s.whatsapp.net"
+  // Campos PN que a veces trae Baileys cuando remoteJid llega como @lid.
   addCandidate(candidates, key?.senderPn);
-
-  // Otros posibles nombres según evento/versión.
   addCandidate(candidates, key?.participantPn);
   addCandidate(candidates, key?.remoteJidPn);
+  addCandidate(candidates, key?.chatPn);
+  addCandidate(candidates, key?.authorPn);
+
+  // Otros posibles nombres según versión/evento.
   addCandidate(candidates, key?.senderJid);
   addCandidate(candidates, key?.sender);
   addCandidate(candidates, key?.author);
@@ -90,6 +110,8 @@ function collectCandidateJids(remoteJid: string, key?: any): string[] {
   addCandidate(candidates, key?.chat);
   addCandidate(candidates, key?.idRemoteJid);
   addCandidate(candidates, key?.recipientJid);
+  addCandidate(candidates, key?.remoteJidActual);
+  addCandidate(candidates, key?.participantActual);
 
   return candidates;
 }
@@ -110,7 +132,7 @@ export function extractIdentifiers(remoteJid: string, key?: any) {
     }
 
     if (!lid && isLidJid(candidate)) {
-      lid = candidate;
+      lid = normalizeLidJid(candidate) || candidate;
       continue;
     }
   }
@@ -128,7 +150,7 @@ export function extractIdentifiers(remoteJid: string, key?: any) {
   }
 
   if (isLidJid(remoteJid)) {
-    lid = remoteJid;
+    lid = normalizeLidJid(remoteJid) || remoteJid;
   }
 
   return {
