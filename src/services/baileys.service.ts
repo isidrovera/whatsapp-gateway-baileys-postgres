@@ -30,7 +30,11 @@ import {
   getMessageType,
   getMimeType,
 } from '../utils/message.js';
-import { getBooleanConfig, getConfigValue } from './config.service.js';
+import {
+  getBooleanConfig,
+  getConfigValue,
+  getNumberConfig,
+} from './config.service.js';
 import {
   maybeBase64,
   saveIncomingMedia,
@@ -39,6 +43,13 @@ import {
 } from './media.service.js';
 import { postToInboundWebhook } from './webhook.service.js';
 import { markOdooOutboxSent } from './odoo.service.js';
+
+type SendMessageSafeOptions = {
+  traceId?: string;
+  outboxId?: number | false | null;
+  timeoutMs?: number;
+  messageType?: string;
+};
 
 class WhatsAppGateway {
   private sock: WASocket | null = null;
@@ -65,6 +76,53 @@ class WhatsAppGateway {
       qr: this.currentQR,
       qrDataURL: this.qrDataURL,
     };
+  }
+
+  private serializeError(error: any) {
+    return {
+      name: error?.name || 'Error',
+      message: error?.message || String(error),
+      stack: error?.stack || null,
+      code: error?.code || null,
+      statusCode: error?.output?.statusCode || error?.statusCode || null,
+    };
+  }
+
+  private async createTraceLog(params: {
+    type: string;
+    status: string;
+    phone?: string | null;
+    jid?: string | null;
+    lid?: string | null;
+    rawJid?: string | null;
+    payload?: any;
+    response?: any;
+    error?: string | null;
+  }) {
+    try {
+      await prisma.eventLog.create({
+        data: {
+          type: params.type,
+          status: params.status,
+          phone: params.phone || null,
+          jid: params.jid || null,
+          lid: params.lid || null,
+          rawJid: params.rawJid || null,
+          payload: params.payload || {},
+          response: params.response || undefined,
+          error: params.error || undefined,
+        },
+      });
+    } catch (err) {
+      logger.warn(
+        {
+          err,
+          traceType: params.type,
+          traceStatus: params.status,
+        },
+        '[TRACE] No se pudo guardar eventLog'
+      );
+    }
   }
 
   private markBotMessageId(id?: string | null) {
@@ -221,10 +279,6 @@ class WhatsAppGateway {
 
     if (raw.protocolMessage) return true;
 
-    /*
-     * senderKeyDistributionMessage puede venir junto con conversation en grupos.
-     * Si viene solo, es interno; si viene con texto, se deja procesar.
-     */
     const keys = Object.keys(raw);
     if (raw.senderKeyDistributionMessage && keys.length === 1) return true;
 
@@ -386,6 +440,205 @@ class WhatsAppGateway {
     return ids;
   }
 
+  private async getSendTimeoutMs(defaultValue: number) {
+    const configured = await getNumberConfig('WHATSAPP_SEND_TIMEOUT_MS');
+    return configured && configured > 0 ? configured : defaultValue;
+  }
+
+  private async withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    errorMessage: string
+  ): Promise<T> {
+    let timeout: NodeJS.Timeout | null = null;
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => {
+        reject(new Error(errorMessage));
+      }, timeoutMs);
+    });
+
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+    }
+  }
+
+  private async sendMessageSafe(
+    jid: string,
+    payload: any,
+    options: SendMessageSafeOptions = {}
+  ) {
+    if (!this.sock || !this.ready) {
+      const error = new Error('WhatsApp no conectado');
+
+      logger.error(
+        {
+          jid,
+          outboxId: options.outboxId || false,
+          traceId: options.traceId || '',
+          ready: this.ready,
+          hasSocket: !!this.sock,
+        },
+        '[WA-OUT] intento de envío sin conexión'
+      );
+
+      throw error;
+    }
+
+    const timeoutMs =
+      options.timeoutMs ||
+      await this.getSendTimeoutMs(options.messageType === 'text' ? 30000 : 60000);
+
+    const startedAt = Date.now();
+
+    logger.info(
+      {
+        jid,
+        traceId: options.traceId || '',
+        outboxId: options.outboxId || false,
+        messageType: options.messageType || 'unknown',
+        timeoutMs,
+        connected: this.ready,
+      },
+      '[WA-OUT] iniciando envío'
+    );
+
+    await this.createTraceLog({
+      type: 'whatsapp.outgoing.attempt',
+      status: 'pending',
+      phone: isLidJid(jid) ? null : cleanPhone(jid),
+      jid: isLidJid(jid) ? null : jid,
+      lid: isLidJid(jid) ? jid : null,
+      rawJid: jid,
+      payload: {
+        traceId: options.traceId || '',
+        outboxId: options.outboxId || false,
+        messageType: options.messageType || 'unknown',
+        timeoutMs,
+      },
+    });
+
+    try {
+      const resp = await this.withTimeout(
+        this.sock.sendMessage(jid, payload),
+        timeoutMs,
+        `Timeout enviando mensaje WhatsApp a ${jid}`
+      );
+
+      const externalMessageId = resp?.key?.id || '';
+
+      if (!externalMessageId) {
+        throw new Error(`Baileys no devolvió externalMessageId para ${jid}`);
+      }
+
+      logger.info(
+        {
+          jid,
+          traceId: options.traceId || '',
+          outboxId: options.outboxId || false,
+          externalMessageId,
+          elapsedMs: Date.now() - startedAt,
+        },
+        '[WA-OUT] mensaje confirmado por Baileys'
+      );
+
+      await this.createTraceLog({
+        type: 'whatsapp.outgoing.success',
+        status: 'success',
+        phone: isLidJid(jid) ? null : cleanPhone(jid),
+        jid: isLidJid(jid) ? null : jid,
+        lid: isLidJid(jid) ? jid : null,
+        rawJid: jid,
+        payload: {
+          traceId: options.traceId || '',
+          outboxId: options.outboxId || false,
+          messageType: options.messageType || 'unknown',
+        },
+        response: {
+          externalMessageId,
+          elapsedMs: Date.now() - startedAt,
+        },
+      });
+
+      return resp;
+    } catch (err: any) {
+      const serialized = this.serializeError(err);
+
+      logger.error(
+        {
+          err: serialized,
+          jid,
+          traceId: options.traceId || '',
+          outboxId: options.outboxId || false,
+          elapsedMs: Date.now() - startedAt,
+        },
+        '[WA-OUT] error enviando mensaje por Baileys'
+      );
+
+      await this.createTraceLog({
+        type: 'whatsapp.outgoing.error',
+        status: 'error',
+        phone: isLidJid(jid) ? null : cleanPhone(jid),
+        jid: isLidJid(jid) ? null : jid,
+        lid: isLidJid(jid) ? jid : null,
+        rawJid: jid,
+        payload: {
+          traceId: options.traceId || '',
+          outboxId: options.outboxId || false,
+          messageType: options.messageType || 'unknown',
+          timeoutMs,
+          elapsedMs: Date.now() - startedAt,
+        },
+        error: serialized.message,
+        response: serialized,
+      });
+
+      throw err;
+    }
+  }
+
+  private async traceOutboxFailure(params: {
+    outboxId?: number | false | null;
+    jid?: string | null;
+    traceId?: string;
+    error: any;
+  }) {
+    if (!params.outboxId) {
+      return;
+    }
+
+    const serialized = this.serializeError(params.error);
+
+    logger.error(
+      {
+        outboxId: params.outboxId,
+        jid: params.jid || '',
+        traceId: params.traceId || '',
+        error: serialized,
+      },
+      '[ODOO-OUTBOX] fallo al enviar respuesta WhatsApp'
+    );
+
+    await this.createTraceLog({
+      type: 'odoo.outbox.send_failed',
+      status: 'error',
+      phone: params.jid && !isLidJid(params.jid) ? cleanPhone(params.jid) : null,
+      jid: params.jid && !isLidJid(params.jid) ? params.jid : null,
+      lid: params.jid && isLidJid(params.jid) ? params.jid : null,
+      rawJid: params.jid || null,
+      payload: {
+        outboxId: params.outboxId,
+        traceId: params.traceId || '',
+      },
+      error: serialized.message,
+      response: serialized,
+    });
+  }
+
   async initialize(forceNew = false) {
     const authDir = await this.getAuthDir();
 
@@ -412,25 +665,14 @@ class WhatsAppGateway {
         keys: makeCacheableSignalKeyStore(state.keys, logger as any),
       },
       logger: logger as any,
-
-      /*
-       * Mantiene Baileys como cliente liviano, pero con fingerprint más estable
-       * para VPS/Linux.
-       */
       browser: Browsers.ubuntu('Chrome'),
-
       printQRInTerminal: false,
       markOnlineOnConnect: true,
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
-
-      /*
-       * Ayuda en reintentos/contexto de mensajes.
-       */
       getMessage: async (key: any) => {
         return this.getMessageForRetry(key);
       },
-
       connectTimeoutMs: 60000,
       keepAliveIntervalMs: 10000,
       defaultQueryTimeoutMs: 60000,
@@ -459,20 +701,39 @@ class WhatsAppGateway {
             },
             'WhatsApp conectado'
           );
+
+          await this.createTraceLog({
+            type: 'whatsapp.connection.open',
+            status: 'success',
+            payload: {
+              user: this.sock?.user || null,
+            },
+          });
         }
 
         if (connection === 'close') {
           this.ready = false;
 
           const code = (lastDisconnect?.error as Boom)?.output?.statusCode;
+          const errorMessage = (lastDisconnect?.error as any)?.message || '';
 
           logger.warn(
             {
               code,
-              error: (lastDisconnect?.error as any)?.message,
+              error: errorMessage,
             },
             'WhatsApp desconectado'
           );
+
+          await this.createTraceLog({
+            type: 'whatsapp.connection.close',
+            status: 'error',
+            payload: {
+              code,
+              error: errorMessage,
+            },
+            error: errorMessage || `Disconnect code ${code || 'unknown'}`,
+          });
 
           if (code === DisconnectReason.restartRequired) {
             return this.scheduleReconnect(false);
@@ -517,10 +778,6 @@ class WhatsAppGateway {
         '[WA-IN] messages.upsert recibido'
       );
 
-      /*
-       * Tu lógica real procesa notify.
-       * append/replace solo se registran para diagnóstico y evitar duplicados.
-       */
       if (type !== 'notify') {
         logger.debug({ type }, '[WA-IN] upsert ignorado por tipo');
         return;
@@ -544,6 +801,13 @@ class WhatsAppGateway {
       throw new Error('Teléfono inválido para pairing code');
     }
 
+    logger.info(
+      {
+        phone: clean,
+      },
+      '[WA-AUTH] solicitando pairing code'
+    );
+
     return this.sock.requestPairingCode(clean);
   }
 
@@ -553,9 +817,21 @@ class WhatsAppGateway {
       this.reconnectTimer = null;
     }
 
+    logger.info(
+      {
+        logout,
+        connected: this.ready,
+        hasSocket: !!this.sock,
+      },
+      '[WA] desconectando socket'
+    );
+
     if (this.sock) {
       if (logout) {
-        await this.sock.logout().catch(() => undefined);
+        await this.sock.logout().catch((err) => {
+          logger.warn({ err }, '[WA] error haciendo logout');
+          return undefined;
+        });
       } else {
         this.sock.end(undefined);
       }
@@ -589,16 +865,36 @@ class WhatsAppGateway {
     return groups;
   }
 
-  async sendText(to: string, message: string) {
+  async sendText(
+    to: string,
+    message: string,
+    options: SendMessageSafeOptions = {}
+  ) {
     if (!this.sock || !this.ready) {
       throw new Error('WhatsApp no conectado');
     }
 
-    const jid = jidFromTo(to);
+    const text = String(message || '').trim();
 
-    const resp = await this.sock.sendMessage(jid, {
-      text: message,
-    });
+    if (!text) {
+      throw new Error('Mensaje vacío');
+    }
+
+    const jid = jidFromTo(to);
+    const traceId = options.traceId || `text-${Date.now()}`;
+
+    const resp = await this.sendMessageSafe(
+      jid,
+      {
+        text,
+      },
+      {
+        ...options,
+        traceId,
+        messageType: 'text',
+        timeoutMs: options.timeoutMs || await this.getSendTimeoutMs(30000),
+      }
+    );
 
     this.markBotMessageId(resp?.key?.id);
     this.cacheMessage(resp?.key?.id, resp?.message);
@@ -612,7 +908,7 @@ class WhatsAppGateway {
         lid: isLidJid(jid) ? jid : null,
         rawJid: jid,
         messageType: 'text',
-        content: message,
+        content: text,
         externalMessageId: resp?.key?.id || null,
       },
     });
@@ -620,6 +916,8 @@ class WhatsAppGateway {
     logger.info(
       {
         to: jid,
+        traceId,
+        outboxId: options.outboxId || false,
         externalMessageId: resp?.key?.id,
       },
       'Mensaje de texto enviado'
@@ -636,15 +934,31 @@ class WhatsAppGateway {
     mimetype?: string;
     filename?: string;
     caption?: string;
+    traceId?: string;
+    outboxId?: number | false | null;
   }) {
     if (!this.sock || !this.ready) {
       throw new Error('WhatsApp no conectado');
     }
 
     const jid = jidFromTo(params.to);
+    const traceId = params.traceId || `media-${params.media_type}-${Date.now()}`;
 
     let buffer: Buffer;
     let mimetype = params.mimetype || 'application/octet-stream';
+
+    logger.info(
+      {
+        jid,
+        traceId,
+        outboxId: params.outboxId || false,
+        mediaType: params.media_type,
+        hasUrl: !!params.url,
+        hasBase64: !!params.base64,
+        filename: params.filename || '',
+      },
+      '[WA-OUT] preparando multimedia'
+    );
 
     if (params.url) {
       const downloaded = await getBufferFromUrl(params.url);
@@ -657,29 +971,66 @@ class WhatsAppGateway {
     }
 
     let resp: any;
+    const timeoutMs = await this.getSendTimeoutMs(60000);
 
     if (params.media_type === 'image') {
-      resp = await this.sock.sendMessage(jid, {
-        image: buffer,
-        caption: params.caption || '',
-      });
+      resp = await this.sendMessageSafe(
+        jid,
+        {
+          image: buffer,
+          caption: params.caption || '',
+        },
+        {
+          traceId,
+          outboxId: params.outboxId || false,
+          messageType: 'image',
+          timeoutMs,
+        }
+      );
     } else if (params.media_type === 'audio') {
-      resp = await this.sock.sendMessage(jid, {
-        audio: buffer,
-        mimetype,
-      });
+      resp = await this.sendMessageSafe(
+        jid,
+        {
+          audio: buffer,
+          mimetype,
+        },
+        {
+          traceId,
+          outboxId: params.outboxId || false,
+          messageType: 'audio',
+          timeoutMs,
+        }
+      );
     } else if (params.media_type === 'video') {
-      resp = await this.sock.sendMessage(jid, {
-        video: buffer,
-        caption: params.caption || '',
-      });
+      resp = await this.sendMessageSafe(
+        jid,
+        {
+          video: buffer,
+          caption: params.caption || '',
+        },
+        {
+          traceId,
+          outboxId: params.outboxId || false,
+          messageType: 'video',
+          timeoutMs,
+        }
+      );
     } else {
-      resp = await this.sock.sendMessage(jid, {
-        document: buffer,
-        mimetype,
-        fileName: params.filename || 'archivo',
-        caption: params.caption || '',
-      });
+      resp = await this.sendMessageSafe(
+        jid,
+        {
+          document: buffer,
+          mimetype,
+          fileName: params.filename || 'archivo',
+          caption: params.caption || '',
+        },
+        {
+          traceId,
+          outboxId: params.outboxId || false,
+          messageType: 'document',
+          timeoutMs,
+        }
+      );
     }
 
     this.markBotMessageId(resp?.key?.id);
@@ -703,6 +1054,8 @@ class WhatsAppGateway {
     logger.info(
       {
         to: jid,
+        traceId,
+        outboxId: params.outboxId || false,
         mediaType: params.media_type,
         mimetype,
         externalMessageId: resp?.key?.id,
@@ -783,12 +1136,14 @@ class WhatsAppGateway {
   private async handleIncomingMessage(message: proto.IWebMessageInfo) {
     const messageId = message.key?.id || '';
     const remoteJid = this.getRemoteJid(message);
+    const traceId = `in-${messageId || Date.now()}`;
 
     try {
       this.cacheMessage(messageId, message.message);
 
       logger.info(
         {
+          traceId,
           messageId,
           remoteJid,
           fromMe: message.key?.fromMe || false,
@@ -805,32 +1160,29 @@ class WhatsAppGateway {
       );
 
       if (this.getTimestampMs(message) < this.startTime - 15000) {
-        logger.info({ messageId }, '[WA-IN] mensaje antiguo ignorado');
+        logger.info({ traceId, messageId }, '[WA-IN] mensaje antiguo ignorado');
         return;
       }
 
       if (!remoteJid || remoteJid === 'status@broadcast') {
-        logger.info({ messageId, remoteJid }, '[WA-IN] jid vacío/status ignorado');
+        logger.info({ traceId, messageId, remoteJid }, '[WA-IN] jid vacío/status ignorado');
         return;
       }
 
-      /*
-       * Se mantiene tu lógica: no procesar mensajes propios para evitar loop.
-       * Solo se loguean mejor arriba.
-       */
       if (message.key?.fromMe) {
-        logger.info({ messageId, remoteJid }, '[WA-IN] mensaje propio ignorado');
+        logger.info({ traceId, messageId, remoteJid }, '[WA-IN] mensaje propio ignorado');
         return;
       }
 
       if (this.isFromBotById(messageId)) {
-        logger.info({ messageId, remoteJid }, '[WA-IN] mensaje enviado por bot ignorado');
+        logger.info({ traceId, messageId, remoteJid }, '[WA-IN] mensaje enviado por bot ignorado');
         return;
       }
 
       if (this.isInternalOrUnsupportedMessage(message)) {
         logger.info(
           {
+            traceId,
             messageId,
             remoteJid,
             keys: message.message ? Object.keys(message.message as any) : [],
@@ -845,7 +1197,7 @@ class WhatsAppGateway {
 
       if (isGroupJid(remoteJid)) {
         if (await getBooleanConfig('IGNORE_GROUPS')) {
-          logger.info({ remoteJid }, '[WA-IN] grupo ignorado');
+          logger.info({ traceId, remoteJid }, '[WA-IN] grupo ignorado');
           await this.reportGroup(message, remoteJid, text, messageType);
           return;
         }
@@ -856,6 +1208,7 @@ class WhatsAppGateway {
 
       logger.info(
         {
+          traceId,
           messageId,
           remoteJid,
           phone: ids.phone,
@@ -873,7 +1226,7 @@ class WhatsAppGateway {
 
       const media = await this.buildMediaPayload(message, messageType).catch(
         (err) => {
-          logger.error({ err, messageId }, '[WA-IN] error descargando media');
+          logger.error({ err, traceId, messageId }, '[WA-IN] error descargando media');
           return null;
         }
       );
@@ -881,7 +1234,7 @@ class WhatsAppGateway {
       const finalText = text || (media ? `[El usuario envió ${messageType}]` : '');
 
       if (!finalText && !media) {
-        logger.info({ messageId, messageType }, '[WA-IN] sin texto ni media, ignorado');
+        logger.info({ traceId, messageId, messageType }, '[WA-IN] sin texto ni media, ignorado');
         return;
       }
 
@@ -920,66 +1273,90 @@ class WhatsAppGateway {
 
       logger.info(
         {
+          traceId,
           messageId,
           phone: ids.phone,
           jid: ids.jid,
           lid: ids.lid,
           message: finalText,
         },
-        '[WA-IN] enviando a webhook n8n'
+        '[WA-IN] enviando a webhook n8n/Odoo'
       );
 
       const response = await postToInboundWebhook(inboundPayload);
 
       logger.info(
         {
+          traceId,
           messageId,
           ok: response?.ok,
           shouldSend: response?.shouldSend,
           outbox_id: response?.outbox_id,
-          message: response?.message,
+          odoo_message_id: response?.odoo_message_id,
+          hasMessage: !!response?.message,
         },
-        '[WA-IN] respuesta webhook n8n'
+        '[WA-IN] respuesta webhook n8n/Odoo'
       );
 
       if (!response?.ok || !response.shouldSend) {
-        logger.info({ messageId }, '[WA-IN] webhook no pidió responder');
+        logger.info({ traceId, messageId }, '[WA-IN] webhook no pidió responder');
         return;
       }
 
       const responseText = String(response.message || '').trim();
 
       if (!responseText) {
-        logger.info({ messageId }, '[WA-IN] webhook sin texto de respuesta');
+        logger.info({ traceId, messageId }, '[WA-IN] webhook sin texto de respuesta');
         return;
       }
 
-      /*
-       * Se responde al mismo remoteJid que llegó.
-       * Si llegó por @lid, se responde por @lid.
-       * Si llegó por número, se responde por @s.whatsapp.net.
-       */
-      const sent = await this.sendText(remoteJid, responseText);
+      try {
+        const sent = await this.sendText(remoteJid, responseText, {
+          traceId: `${traceId}-reply`,
+          outboxId: response.outbox_id || false,
+          timeoutMs: await this.getSendTimeoutMs(30000),
+        });
 
-      logger.info(
-        {
-          messageId,
-          externalMessageId: sent?.key?.id,
-          outbox_id: response.outbox_id,
-        },
-        '[WA-IN] respuesta enviada por WhatsApp'
-      );
-
-      if (response.outbox_id) {
-        await markOdooOutboxSent(
-          Number(response.outbox_id),
-          sent?.key?.id || ''
+        logger.info(
+          {
+            traceId,
+            messageId,
+            externalMessageId: sent?.key?.id,
+            outbox_id: response.outbox_id,
+          },
+          '[WA-IN] respuesta enviada por WhatsApp'
         );
+
+        if (response.outbox_id) {
+          await markOdooOutboxSent(
+            Number(response.outbox_id),
+            sent?.key?.id || ''
+          );
+
+          logger.info(
+            {
+              traceId,
+              outbox_id: response.outbox_id,
+              externalMessageId: sent?.key?.id || '',
+            },
+            '[ODOO-OUTBOX] marcado como enviado'
+          );
+        }
+      } catch (sendErr) {
+        await this.traceOutboxFailure({
+          outboxId: response.outbox_id || false,
+          jid: remoteJid,
+          traceId,
+          error: sendErr,
+        });
+
+        throw sendErr;
       }
     } catch (err) {
       logger.error(
         {
-          err,
+          err: this.serializeError(err),
+          traceId,
           messageId,
           remoteJid,
           keys: message.message ? Object.keys(message.message as any) : [],
