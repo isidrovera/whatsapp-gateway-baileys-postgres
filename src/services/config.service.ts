@@ -11,6 +11,7 @@ export type ConfigKey =
   | 'MEDIA_DIR'
   | 'INBOUND_WEBHOOK_URL'
   | 'WEBHOOK_TIMEOUT_MS'
+  | 'WHATSAPP_SEND_TIMEOUT_MS'
   | 'WEBHOOK_INCLUDE_MEDIA_BASE64'
   | 'ODOO_BASE_URL'
   | 'ODOO_WHATSAPP_TOKEN'
@@ -50,6 +51,7 @@ export const DEFAULT_CONFIG: Record<ConfigKey, string> = {
   MEDIA_DIR: './storage/media',
   INBOUND_WEBHOOK_URL: '',
   WEBHOOK_TIMEOUT_MS: '30000',
+  WHATSAPP_SEND_TIMEOUT_MS: '30000',
   WEBHOOK_INCLUDE_MEDIA_BASE64: 'false',
   ODOO_BASE_URL: '',
   ODOO_WHATSAPP_TOKEN: '',
@@ -80,7 +82,9 @@ export async function getConfigValue(key: ConfigKey): Promise<string> {
 
 export async function getBooleanConfig(key: ConfigKey): Promise<boolean> {
   const value = await getConfigValue(key);
-  return ['true', '1', 'yes', 'y', 'si', 'sí'].includes(String(value).toLowerCase());
+  return ['true', '1', 'yes', 'y', 'si', 'sí'].includes(
+    String(value).toLowerCase()
+  );
 }
 
 export async function getNumberConfig(key: ConfigKey): Promise<number> {
