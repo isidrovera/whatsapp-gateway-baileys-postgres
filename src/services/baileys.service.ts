@@ -640,155 +640,242 @@ class WhatsAppGateway {
   }
 
   async initialize(forceNew = false) {
-    const authDir = await this.getAuthDir();
+  const authDir = await this.getAuthDir();
 
-    if (forceNew && fs.existsSync(authDir)) {
-      fs.rmSync(authDir, { recursive: true, force: true });
-      fs.mkdirSync(authDir, { recursive: true });
-    }
+  if (forceNew && fs.existsSync(authDir)) {
+    fs.rmSync(authDir, { recursive: true, force: true });
+    fs.mkdirSync(authDir, { recursive: true });
+  }
 
-    const { state, saveCreds } = await useMultiFileAuthState(authDir);
-    const { version } = await fetchLatestBaileysVersion();
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+  const { version } = await fetchLatestBaileysVersion();
 
-    logger.info(
-      {
-        version: version.join('.'),
-        authDir,
-      },
-      'Iniciando Baileys'
-    );
+  logger.info(
+    {
+      version: version.join('.'),
+      authDir,
+      forceNew,
+    },
+    'Iniciando Baileys'
+  );
 
-    this.sock = makeWASocket({
-      version,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger as any),
-      },
-      logger: logger as any,
-      browser: Browsers.ubuntu('Chrome'),
-      printQRInTerminal: false,
-      markOnlineOnConnect: true,
-      syncFullHistory: false,
-      shouldSyncHistoryMessage: () => false,
-      getMessage: async (key: any) => {
-        return this.getMessageForRetry(key);
-      },
-      connectTimeoutMs: 60000,
-      keepAliveIntervalMs: 10000,
-      defaultQueryTimeoutMs: 60000,
-    });
+  this.sock = makeWASocket({
+    version,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger as any),
+    },
 
-    this.sock.ev.on('creds.update', saveCreds);
+    logger: logger as any,
 
-    this.sock.ev.on(
-      'connection.update',
-      async ({ connection, lastDisconnect, qr }) => {
-        if (qr) {
-          this.currentQR = qr;
+    /*
+     * Configuración tomada del servicio anterior que no presentaba
+     * el problema de "Esperando el mensaje".
+     *
+     * Antes se usaba:
+     * browser: ['Chrome', 'Chrome', '120.0.0']
+     * markOnlineOnConnect: false
+     * generateHighQualityLinkPreview: false
+     * keepAliveIntervalMs: 15000
+     */
+    browser: ['Chrome', 'Chrome', '120.0.0'],
+
+    printQRInTerminal: false,
+    markOnlineOnConnect: false,
+    syncFullHistory: false,
+    shouldSyncHistoryMessage: () => false,
+    generateHighQualityLinkPreview: false,
+
+    /*
+     * Mantiene soporte para reintentos/contexto de mensajes.
+     */
+    getMessage: async (key: any) => {
+      return this.getMessageForRetry(key);
+    },
+
+    /*
+     * Tiempos de conexión.
+     * Se sube keepAlive a 15000 como en el servicio anterior.
+     */
+    connectTimeoutMs: 60000,
+    keepAliveIntervalMs: 15000,
+    defaultQueryTimeoutMs: 60000,
+  });
+
+  this.sock.ev.on('creds.update', saveCreds);
+
+  this.sock.ev.on(
+    'connection.update',
+    async ({ connection, lastDisconnect, qr }) => {
+      if (qr) {
+        this.currentQR = qr;
+
+        try {
           this.qrDataURL = await QRCode.toDataURL(qr);
           logger.info('QR disponible en /api/qr');
+        } catch (err) {
+          logger.error({ err }, '[WA-AUTH] error generando QR DataURL');
         }
+      }
 
-        if (connection === 'open') {
-          this.ready = true;
-          this.currentQR = null;
-          this.qrDataURL = null;
-          this.retryCount = 0;
+      if (connection === 'connecting') {
+        logger.info(
+          {
+            retryCount: this.retryCount,
+            hasQR: !!this.currentQR,
+          },
+          '[WA-CONN] conectando a WhatsApp'
+        );
+      }
 
+      if (connection === 'open') {
+        this.ready = true;
+        this.currentQR = null;
+        this.qrDataURL = null;
+        this.retryCount = 0;
+
+        logger.info(
+          {
+            user: this.sock?.user,
+            browser: ['Chrome', 'Chrome', '120.0.0'],
+            markOnlineOnConnect: false,
+            keepAliveIntervalMs: 15000,
+          },
+          'WhatsApp conectado'
+        );
+
+        await this.createTraceLog({
+          type: 'whatsapp.connection.open',
+          status: 'success',
+          payload: {
+            user: this.sock?.user || null,
+            browser: ['Chrome', 'Chrome', '120.0.0'],
+            markOnlineOnConnect: false,
+            keepAliveIntervalMs: 15000,
+          },
+        });
+      }
+
+      if (connection === 'close') {
+        this.ready = false;
+
+        const code = (lastDisconnect?.error as Boom)?.output?.statusCode;
+        const errorMessage = (lastDisconnect?.error as any)?.message || '';
+
+        logger.warn(
+          {
+            code,
+            error: errorMessage,
+            retryCount: this.retryCount,
+          },
+          'WhatsApp desconectado'
+        );
+
+        await this.createTraceLog({
+          type: 'whatsapp.connection.close',
+          status: 'error',
+          payload: {
+            code,
+            error: errorMessage,
+            retryCount: this.retryCount,
+          },
+          error: errorMessage || `Disconnect code ${code || 'unknown'}`,
+        });
+
+        if (code === DisconnectReason.restartRequired) {
           logger.info(
             {
-              user: this.sock?.user,
+              code,
             },
-            'WhatsApp conectado'
+            '[WA-CONN] restartRequired recibido, reconectando'
           );
 
-          await this.createTraceLog({
-            type: 'whatsapp.connection.open',
-            status: 'success',
-            payload: {
-              user: this.sock?.user || null,
-            },
-          });
+          return this.scheduleReconnect(false);
         }
 
-        if (connection === 'close') {
-          this.ready = false;
-
-          const code = (lastDisconnect?.error as Boom)?.output?.statusCode;
-          const errorMessage = (lastDisconnect?.error as any)?.message || '';
-
+        if (code === DisconnectReason.loggedOut) {
           logger.warn(
             {
               code,
-              error: errorMessage,
             },
-            'WhatsApp desconectado'
+            '[WA-CONN] loggedOut recibido, se forzará nueva sesión'
           );
 
-          await this.createTraceLog({
-            type: 'whatsapp.connection.close',
-            status: 'error',
-            payload: {
+          return this.scheduleReconnect(true);
+        }
+
+        if (code === 405) {
+          logger.error(
+            {
               code,
               error: errorMessage,
             },
-            error: errorMessage || `Disconnect code ${code || 'unknown'}`,
-          });
+            'Error 405 WhatsApp. No se reconecta para evitar bloqueo.'
+          );
 
-          if (code === DisconnectReason.restartRequired) {
-            return this.scheduleReconnect(false);
-          }
-
-          if (code === DisconnectReason.loggedOut) {
-            return this.scheduleReconnect(true);
-          }
-
-          if (code === 405) {
-            logger.error(
-              'Error 405 WhatsApp. No se reconecta para evitar bloqueo.'
-            );
-            return;
-          }
-
-          this.scheduleReconnect(false);
+          return;
         }
+
+        this.scheduleReconnect(false);
       }
+    }
+  );
+
+  this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    logger.info(
+      {
+        type,
+        count: messages?.length || 0,
+        messages: (messages || []).map((m) => ({
+          id: m.key?.id,
+          remoteJid: m.key?.remoteJid,
+          participant: m.key?.participant,
+          remoteJidAlt: (m.key as any)?.remoteJidAlt,
+          participantAlt: (m.key as any)?.participantAlt,
+          senderPn: (m.key as any)?.senderPn,
+          participantPn: (m.key as any)?.participantPn,
+          remoteJidPn: (m.key as any)?.remoteJidPn,
+          fromMe: m.key?.fromMe,
+          hasMessage: !!m.message,
+          keys: m.message ? Object.keys(m.message as any) : [],
+          stubType: (m as any).messageStubType,
+        })),
+      },
+      '[WA-IN] messages.upsert recibido'
     );
 
-    this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      logger.info(
+    /*
+     * Igual que antes: solo procesamos notify.
+     * append/replace se ignoran para evitar procesar eventos locales propios.
+     */
+    if (type !== 'notify') {
+      logger.debug(
         {
           type,
-          count: messages?.length || 0,
-          messages: (messages || []).map((m) => ({
-            id: m.key?.id,
-            remoteJid: m.key?.remoteJid,
-            participant: m.key?.participant,
-            remoteJidAlt: (m.key as any)?.remoteJidAlt,
-            participantAlt: (m.key as any)?.participantAlt,
-            senderPn: (m.key as any)?.senderPn,
-            participantPn: (m.key as any)?.participantPn,
-            remoteJidPn: (m.key as any)?.remoteJidPn,
-            fromMe: m.key?.fromMe,
-            hasMessage: !!m.message,
-            keys: m.message ? Object.keys(m.message as any) : [],
-            stubType: (m as any).messageStubType,
-          })),
         },
-        '[WA-IN] messages.upsert recibido'
+        '[WA-IN] upsert ignorado por tipo'
       );
+      return;
+    }
 
-      if (type !== 'notify') {
-        logger.debug({ type }, '[WA-IN] upsert ignorado por tipo');
-        return;
-      }
+    for (const msg of messages || []) {
+      this.cacheMessage(msg.key?.id, msg.message);
+      await this.handleIncomingMessage(msg);
+    }
+  });
 
-      for (const msg of messages || []) {
-        this.cacheMessage(msg.key?.id, msg.message);
-        await this.handleIncomingMessage(msg);
-      }
-    });
-  }
+  logger.info(
+    {
+      version: version.join('.'),
+      authDir,
+      browser: ['Chrome', 'Chrome', '120.0.0'],
+      markOnlineOnConnect: false,
+      generateHighQualityLinkPreview: false,
+      keepAliveIntervalMs: 15000,
+    },
+    '[WA] Cliente Baileys inicializado'
+  );
+}
 
   async requestPairingCode(phone: string) {
     if (!this.sock) {
