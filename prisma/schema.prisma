@@ -33,28 +33,7 @@ model EventLog {
   @@index([createdAt])
 }
 
-model MessageLog {
-  id                Int      @id @default(autoincrement())
-  direction         String
-  chatType          String
-  phone             String?
-  jid               String?
-  lid               String?
-  rawJid            String?
-  messageType       String
-  content           String?
-  externalMessageId String?
-  outboxId          Int?
-  mediaUrl          String?
-  mimetype          String?
-  createdAt         DateTime @default(now())
 
-  @@index([direction])
-  @@index([phone])
-  @@index([externalMessageId])
-  @@index([outboxId])
-  @@index([createdAt])
-}
 
 model User {
   id                  String    @id @default(uuid())
