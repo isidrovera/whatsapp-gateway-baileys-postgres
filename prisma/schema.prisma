@@ -193,3 +193,26 @@ model NotificationRecipient {
   @@unique([ruleId, email])
   @@index([ruleId])
 }
+model MessageLog {
+  id                Int      @id @default(autoincrement())
+  direction         String
+  chatType          String
+  phone             String?
+  jid               String?
+  lid               String?
+  rawJid            String?
+  messageType       String
+  content           String?
+  externalMessageId String?
+  outboxId          Int?
+  mediaUrl          String?
+  mimetype          String?
+  rawProto          Json?      // <-- AÑADIR ESTA LÍNEA
+  createdAt         DateTime @default(now())
+
+  @@index([direction])
+  @@index([phone])
+  @@index([externalMessageId])
+  @@index([outboxId])
+  @@index([createdAt])
+}

@@ -62,6 +62,11 @@ class WhatsAppGateway {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private retryCount = 0;
 
+  // TTL del caché de mensajes (para reenvíos / getMessage).
+  // 60 min cubre con holgura la ventana típica de retry de WhatsApp.
+  private static readonly MESSAGE_CACHE_TTL_MS = 60 * 60 * 1000;
+  private static readonly MESSAGE_CACHE_MAX = 2000;
+
   getStatus() {
     return {
       connected: this.ready,
@@ -145,56 +150,115 @@ class WhatsAppGateway {
     return true;
   }
 
+  // ==================================================
+  // CACHÉ DE MENSAJES (para reenvíos / getMessage)
+  // ==================================================
   private cacheMessage(id?: string | null, message?: proto.IMessage | null) {
     if (!id || !message) return;
 
     this.messageCache.set(id, {
       message,
-      expiresAt: Date.now() + 30 * 60 * 1000,
+      expiresAt: Date.now() + WhatsAppGateway.MESSAGE_CACHE_TTL_MS,
     });
 
-    if (this.messageCache.size > 1000) {
+    logger.debug(
+      {
+        messageId: id,
+        cacheSize: this.messageCache.size,
+      },
+      '[WA-CACHE] mensaje cacheado para posible reenvío'
+    );
+
+    if (this.messageCache.size > WhatsAppGateway.MESSAGE_CACHE_MAX) {
       this.cleanupMessageCache();
     }
   }
 
   private cleanupMessageCache() {
     const now = Date.now();
+    let removedExpired = 0;
 
     for (const [id, item] of this.messageCache.entries()) {
       if (item.expiresAt <= now) {
         this.messageCache.delete(id);
+        removedExpired++;
       }
     }
 
-    if (this.messageCache.size > 1000) {
-      const excess = this.messageCache.size - 1000;
+    let removedExcess = 0;
+    if (this.messageCache.size > WhatsAppGateway.MESSAGE_CACHE_MAX) {
+      const excess = this.messageCache.size - WhatsAppGateway.MESSAGE_CACHE_MAX;
       const ids = Array.from(this.messageCache.keys()).slice(0, excess);
 
       for (const id of ids) {
         this.messageCache.delete(id);
+        removedExcess++;
       }
     }
+
+    logger.debug(
+      {
+        removedExpired,
+        removedExcess,
+        cacheSize: this.messageCache.size,
+      },
+      '[WA-CACHE] limpieza de caché ejecutada'
+    );
   }
 
+  // ==================================================
+  // getMessage: CLAVE PARA EVITAR "Esperando el mensaje"
+  //
+  // WhatsApp llama esto cuando el destinatario no pudo descifrar
+  // un mensaje y pide reenvío. Si devolvemos undefined, el mensaje
+  // se queda en "Esperando el mensaje. Esto puede tomar un tiempo".
+  //
+  // Estrategia de resolución (en orden):
+  //   1) Caché en memoria (proto.IMessage completo) -> cubre cualquier tipo
+  //   2) BD: rawProto serializado (si el schema lo tiene) -> cualquier tipo
+  //   3) BD: reconstrucción de texto desde messageLog.content
+  //   4) Último recurso: objeto vacío (NUNCA undefined) para no romper el flujo
+  // ==================================================
   private async getMessageForRetry(key: any): Promise<proto.IMessage | undefined> {
+    const messageId = key?.id || '';
+    const remoteJid = key?.remoteJid || '';
+
+    logger.info(
+      {
+        messageId,
+        remoteJid,
+        fromMe: key?.fromMe,
+      },
+      '[WA-GETMSG] WhatsApp solicita reenvío de mensaje'
+    );
+
+    if (!messageId) {
+      logger.warn('[WA-GETMSG] sin messageId, devolviendo mensaje vacío de respaldo');
+      return this.emptyFallbackMessage();
+    }
+
+    // ── FUENTE 1: caché en memoria ──
     try {
-      const messageId = key?.id || '';
-
-      if (!messageId) {
-        return undefined;
-      }
-
       const cached = this.messageCache.get(messageId);
 
       if (cached) {
         if (cached.expiresAt > Date.now()) {
+          logger.info(
+            { messageId },
+            '[WA-GETMSG] ✅ resuelto desde caché en memoria'
+          );
           return cached.message;
         }
 
         this.messageCache.delete(messageId);
+        logger.debug({ messageId }, '[WA-GETMSG] caché expirado, eliminado');
       }
+    } catch (err) {
+      logger.warn({ err, messageId }, '[WA-GETMSG] error leyendo caché en memoria');
+    }
 
+    // ── FUENTE 2 y 3: base de datos ──
+    try {
       const logged = await prisma.messageLog.findFirst({
         where: {
           externalMessageId: messageId,
@@ -204,30 +268,78 @@ class WhatsAppGateway {
         },
       });
 
-      if (!logged?.content) {
-        logger.debug({ messageId }, '[WA] getMessage sin registro local');
-        return undefined;
+      if (!logged) {
+        logger.warn(
+          { messageId },
+          '[WA-GETMSG] sin registro en BD; devolviendo mensaje vacío de respaldo'
+        );
+        return this.emptyFallbackMessage();
       }
 
-      if (logged.messageType === 'text') {
-        return {
+      // FUENTE 2: rawProto serializado (cualquier tipo de mensaje).
+      // Defensivo: el campo puede no existir en el schema.
+      const rawProto = (logged as any)?.rawProto;
+      if (rawProto) {
+        try {
+          const parsed =
+            typeof rawProto === 'string' ? JSON.parse(rawProto) : rawProto;
+
+          if (parsed && typeof parsed === 'object') {
+            logger.info(
+              { messageId, messageType: logged.messageType },
+              '[WA-GETMSG] ✅ resuelto desde BD (rawProto)'
+            );
+            // Re-cacheamos para futuros reenvíos del mismo mensaje.
+            this.cacheMessage(messageId, parsed as proto.IMessage);
+            return parsed as proto.IMessage;
+          }
+        } catch (err) {
+          logger.warn(
+            { err, messageId },
+            '[WA-GETMSG] rawProto presente pero no parseable'
+          );
+        }
+      }
+
+      // FUENTE 3: reconstrucción de texto.
+      if (logged.messageType === 'text' && logged.content) {
+        logger.info(
+          { messageId },
+          '[WA-GETMSG] ✅ resuelto desde BD (reconstrucción de texto)'
+        );
+        const reconstructed: proto.IMessage = {
           conversation: logged.content,
         };
+        this.cacheMessage(messageId, reconstructed);
+        return reconstructed;
       }
 
-      logger.debug(
+      logger.warn(
         {
           messageId,
           messageType: logged.messageType,
         },
-        '[WA] getMessage encontrado pero no reconstruible como texto'
+        '[WA-GETMSG] registro hallado pero no reconstruible; devolviendo respaldo vacío'
       );
-
-      return undefined;
     } catch (err) {
-      logger.warn({ err, key }, '[WA] error en getMessageForRetry');
-      return undefined;
+      logger.warn(
+        { err: this.serializeError(err), messageId },
+        '[WA-GETMSG] error consultando BD'
+      );
     }
+
+    // ── FUENTE 4: último recurso ──
+    // Devolver un mensaje vacío (NO undefined) evita que el destinatario
+    // se quede atascado en "Esperando el mensaje".
+    return this.emptyFallbackMessage();
+  }
+
+  private emptyFallbackMessage(): proto.IMessage {
+    // Mensaje vacío seguro. Permite que el flujo de reenvío se cierre
+    // en lugar de quedar colgado indefinidamente.
+    return {
+      conversation: '',
+    };
   }
 
   private async getAuthDir() {
@@ -535,6 +647,10 @@ class WhatsAppGateway {
         throw new Error(`Baileys no devolvió externalMessageId para ${jid}`);
       }
 
+      // Cacheamos el mensaje saliente inmediatamente para soportar reenvíos.
+      this.markBotMessageId(externalMessageId);
+      this.cacheMessage(externalMessageId, resp?.message);
+
       logger.info(
         {
           jid,
@@ -639,243 +755,270 @@ class WhatsAppGateway {
     });
   }
 
-  async initialize(forceNew = false) {
-  const authDir = await this.getAuthDir();
+  // Guarda el proto completo del mensaje en BD (defensivo respecto al schema).
+  private async persistRawProto(
+    externalMessageId: string | null | undefined,
+    message: proto.IMessage | null | undefined
+  ) {
+    if (!externalMessageId || !message) return;
 
-  if (forceNew && fs.existsSync(authDir)) {
-    fs.rmSync(authDir, { recursive: true, force: true });
-    fs.mkdirSync(authDir, { recursive: true });
+    try {
+      const serialized = JSON.stringify(message);
+
+      await prisma.messageLog.updateMany({
+        where: { externalMessageId },
+        data: { rawProto: serialized } as any,
+      });
+
+      logger.debug(
+        { externalMessageId },
+        '[WA-CACHE] rawProto persistido en BD'
+      );
+    } catch (err) {
+      // Si el campo rawProto no existe en el schema, esto falla silenciosamente.
+      // El caché en memoria sigue cubriendo los reenvíos dentro de la ventana TTL.
+      logger.debug(
+        { err: this.serializeError(err), externalMessageId },
+        '[WA-CACHE] no se pudo persistir rawProto (¿falta campo en schema?)'
+      );
+    }
   }
 
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version } = await fetchLatestBaileysVersion();
+  async initialize(forceNew = false) {
+    const authDir = await this.getAuthDir();
 
-  logger.info(
-    {
-      version: version.join('.'),
-      authDir,
-      forceNew,
-    },
-    'Iniciando Baileys'
-  );
+    if (forceNew && fs.existsSync(authDir)) {
+      fs.rmSync(authDir, { recursive: true, force: true });
+      fs.mkdirSync(authDir, { recursive: true });
+    }
 
-  this.sock = makeWASocket({
-    version,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger as any),
-    },
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    const { version } = await fetchLatestBaileysVersion();
 
-    logger: logger as any,
+    logger.info(
+      {
+        version: version.join('.'),
+        authDir,
+        forceNew,
+      },
+      'Iniciando Baileys'
+    );
 
-    /*
-     * Configuración tomada del servicio anterior que no presentaba
-     * el problema de "Esperando el mensaje".
-     *
-     * Antes se usaba:
-     * browser: ['Chrome', 'Chrome', '120.0.0']
-     * markOnlineOnConnect: false
-     * generateHighQualityLinkPreview: false
-     * keepAliveIntervalMs: 15000
-     */
-    browser: ['Chrome', 'Chrome', '120.0.0'],
+    this.sock = makeWASocket({
+      version,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger as any),
+      },
 
-    printQRInTerminal: false,
-    markOnlineOnConnect: false,
-    syncFullHistory: false,
-    shouldSyncHistoryMessage: () => false,
-    generateHighQualityLinkPreview: false,
+      logger: logger as any,
 
-    /*
-     * Mantiene soporte para reintentos/contexto de mensajes.
-     */
-    getMessage: async (key: any) => {
-      return this.getMessageForRetry(key);
-    },
+      browser: ['Chrome', 'Chrome', '120.0.0'],
 
-    /*
-     * Tiempos de conexión.
-     * Se sube keepAlive a 15000 como en el servicio anterior.
-     */
-    connectTimeoutMs: 60000,
-    keepAliveIntervalMs: 15000,
-    defaultQueryTimeoutMs: 60000,
-  });
+      printQRInTerminal: false,
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      shouldSyncHistoryMessage: () => false,
+      generateHighQualityLinkPreview: false,
 
-  this.sock.ev.on('creds.update', saveCreds);
+      /*
+       * getMessage robusto: resuelve desde caché en memoria, luego BD
+       * (rawProto o texto) y, como último recurso, devuelve un mensaje
+       * vacío NUNCA undefined. Esto evita el estado permanente de
+       * "Esperando el mensaje. Esto puede tomar un tiempo" en el destino.
+       */
+      getMessage: async (key: any) => {
+        return this.getMessageForRetry(key);
+      },
 
-  this.sock.ev.on(
-    'connection.update',
-    async ({ connection, lastDisconnect, qr }) => {
-      if (qr) {
-        this.currentQR = qr;
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 15000,
+      defaultQueryTimeoutMs: 60000,
+    });
 
-        try {
-          this.qrDataURL = await QRCode.toDataURL(qr);
-          logger.info('QR disponible en /api/qr');
-        } catch (err) {
-          logger.error({ err }, '[WA-AUTH] error generando QR DataURL');
+    this.sock.ev.on('creds.update', saveCreds);
+
+    this.sock.ev.on(
+      'connection.update',
+      async ({ connection, lastDisconnect, qr }) => {
+        if (qr) {
+          this.currentQR = qr;
+
+          try {
+            this.qrDataURL = await QRCode.toDataURL(qr);
+            logger.info('QR disponible en /api/qr');
+          } catch (err) {
+            logger.error({ err }, '[WA-AUTH] error generando QR DataURL');
+          }
         }
-      }
 
-      if (connection === 'connecting') {
-        logger.info(
-          {
-            retryCount: this.retryCount,
-            hasQR: !!this.currentQR,
-          },
-          '[WA-CONN] conectando a WhatsApp'
-        );
-      }
-
-      if (connection === 'open') {
-        this.ready = true;
-        this.currentQR = null;
-        this.qrDataURL = null;
-        this.retryCount = 0;
-
-        logger.info(
-          {
-            user: this.sock?.user,
-            browser: ['Chrome', 'Chrome', '120.0.0'],
-            markOnlineOnConnect: false,
-            keepAliveIntervalMs: 15000,
-          },
-          'WhatsApp conectado'
-        );
-
-        await this.createTraceLog({
-          type: 'whatsapp.connection.open',
-          status: 'success',
-          payload: {
-            user: this.sock?.user || null,
-            browser: ['Chrome', 'Chrome', '120.0.0'],
-            markOnlineOnConnect: false,
-            keepAliveIntervalMs: 15000,
-          },
-        });
-      }
-
-      if (connection === 'close') {
-        this.ready = false;
-
-        const code = (lastDisconnect?.error as Boom)?.output?.statusCode;
-        const errorMessage = (lastDisconnect?.error as any)?.message || '';
-
-        logger.warn(
-          {
-            code,
-            error: errorMessage,
-            retryCount: this.retryCount,
-          },
-          'WhatsApp desconectado'
-        );
-
-        await this.createTraceLog({
-          type: 'whatsapp.connection.close',
-          status: 'error',
-          payload: {
-            code,
-            error: errorMessage,
-            retryCount: this.retryCount,
-          },
-          error: errorMessage || `Disconnect code ${code || 'unknown'}`,
-        });
-
-        if (code === DisconnectReason.restartRequired) {
+        if (connection === 'connecting') {
           logger.info(
             {
-              code,
+              retryCount: this.retryCount,
+              hasQR: !!this.currentQR,
             },
-            '[WA-CONN] restartRequired recibido, reconectando'
+            '[WA-CONN] conectando a WhatsApp'
           );
-
-          return this.scheduleReconnect(false);
         }
 
-        if (code === DisconnectReason.loggedOut) {
+        if (connection === 'open') {
+          this.ready = true;
+          this.currentQR = null;
+          this.qrDataURL = null;
+          this.retryCount = 0;
+
+          logger.info(
+            {
+              user: this.sock?.user,
+              browser: ['Chrome', 'Chrome', '120.0.0'],
+              markOnlineOnConnect: false,
+              keepAliveIntervalMs: 15000,
+            },
+            'WhatsApp conectado'
+          );
+
+          await this.createTraceLog({
+            type: 'whatsapp.connection.open',
+            status: 'success',
+            payload: {
+              user: this.sock?.user || null,
+              browser: ['Chrome', 'Chrome', '120.0.0'],
+              markOnlineOnConnect: false,
+              keepAliveIntervalMs: 15000,
+            },
+          });
+        }
+
+        if (connection === 'close') {
+          this.ready = false;
+
+          const code = (lastDisconnect?.error as Boom)?.output?.statusCode;
+          const errorMessage = (lastDisconnect?.error as any)?.message || '';
+
           logger.warn(
             {
               code,
+              error: errorMessage,
+              retryCount: this.retryCount,
             },
-            '[WA-CONN] loggedOut recibido, se forzará nueva sesión'
+            'WhatsApp desconectado'
           );
 
-          return this.scheduleReconnect(true);
-        }
-
-        if (code === 405) {
-          logger.error(
-            {
+          await this.createTraceLog({
+            type: 'whatsapp.connection.close',
+            status: 'error',
+            payload: {
               code,
               error: errorMessage,
+              retryCount: this.retryCount,
             },
-            'Error 405 WhatsApp. No se reconecta para evitar bloqueo.'
-          );
+            error: errorMessage || `Disconnect code ${code || 'unknown'}`,
+          });
 
-          return;
+          if (code === DisconnectReason.restartRequired) {
+            logger.info(
+              {
+                code,
+              },
+              '[WA-CONN] restartRequired recibido, reconectando'
+            );
+
+            return this.scheduleReconnect(false);
+          }
+
+          if (code === DisconnectReason.loggedOut) {
+            logger.warn(
+              {
+                code,
+              },
+              '[WA-CONN] loggedOut recibido, se forzará nueva sesión'
+            );
+
+            return this.scheduleReconnect(true);
+          }
+
+          if (code === 405) {
+            logger.error(
+              {
+                code,
+                error: errorMessage,
+              },
+              'Error 405 WhatsApp. No se reconecta para evitar bloqueo.'
+            );
+
+            return;
+          }
+
+          this.scheduleReconnect(false);
         }
-
-        this.scheduleReconnect(false);
       }
-    }
-  );
-
-  this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    logger.info(
-      {
-        type,
-        count: messages?.length || 0,
-        messages: (messages || []).map((m) => ({
-          id: m.key?.id,
-          remoteJid: m.key?.remoteJid,
-          participant: m.key?.participant,
-          remoteJidAlt: (m.key as any)?.remoteJidAlt,
-          participantAlt: (m.key as any)?.participantAlt,
-          senderPn: (m.key as any)?.senderPn,
-          participantPn: (m.key as any)?.participantPn,
-          remoteJidPn: (m.key as any)?.remoteJidPn,
-          fromMe: m.key?.fromMe,
-          hasMessage: !!m.message,
-          keys: m.message ? Object.keys(m.message as any) : [],
-          stubType: (m as any).messageStubType,
-        })),
-      },
-      '[WA-IN] messages.upsert recibido'
     );
 
-    /*
-     * Igual que antes: solo procesamos notify.
-     * append/replace se ignoran para evitar procesar eventos locales propios.
-     */
-    if (type !== 'notify') {
-      logger.debug(
+    this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      logger.info(
         {
           type,
+          count: messages?.length || 0,
+          messages: (messages || []).map((m) => ({
+            id: m.key?.id,
+            remoteJid: m.key?.remoteJid,
+            participant: m.key?.participant,
+            remoteJidAlt: (m.key as any)?.remoteJidAlt,
+            participantAlt: (m.key as any)?.participantAlt,
+            senderPn: (m.key as any)?.senderPn,
+            participantPn: (m.key as any)?.participantPn,
+            remoteJidPn: (m.key as any)?.remoteJidPn,
+            fromMe: m.key?.fromMe,
+            hasMessage: !!m.message,
+            keys: m.message ? Object.keys(m.message as any) : [],
+            stubType: (m as any).messageStubType,
+          })),
         },
-        '[WA-IN] upsert ignorado por tipo'
+        '[WA-IN] messages.upsert recibido'
       );
-      return;
-    }
 
-    for (const msg of messages || []) {
-      this.cacheMessage(msg.key?.id, msg.message);
-      await this.handleIncomingMessage(msg);
-    }
-  });
+      /*
+       * Cacheamos TODOS los mensajes entrantes (cualquier tipo) para soportar
+       * reenvíos, independientemente de si luego se procesan o se ignoran.
+       * Esto se hace para todo 'type', no solo 'notify', porque un reenvío
+       * podría referirse a un mensaje recibido en cualquier evento.
+       */
+      for (const m of messages || []) {
+        this.cacheMessage(m.key?.id, m.message);
+      }
 
-  logger.info(
-    {
-      version: version.join('.'),
-      authDir,
-      browser: ['Chrome', 'Chrome', '120.0.0'],
-      markOnlineOnConnect: false,
-      generateHighQualityLinkPreview: false,
-      keepAliveIntervalMs: 15000,
-    },
-    '[WA] Cliente Baileys inicializado'
-  );
-}
+      /*
+       * Solo procesamos 'notify' para la lógica de negocio.
+       * append/replace se ignoran para no reprocesar eventos locales.
+       */
+      if (type !== 'notify') {
+        logger.debug(
+          {
+            type,
+          },
+          '[WA-IN] upsert ignorado por tipo (solo cacheado)'
+        );
+        return;
+      }
+
+      for (const msg of messages || []) {
+        await this.handleIncomingMessage(msg);
+      }
+    });
+
+    logger.info(
+      {
+        version: version.join('.'),
+        authDir,
+        browser: ['Chrome', 'Chrome', '120.0.0'],
+        markOnlineOnConnect: false,
+        generateHighQualityLinkPreview: false,
+        keepAliveIntervalMs: 15000,
+      },
+      '[WA] Cliente Baileys inicializado'
+    );
+  }
 
   async requestPairingCode(phone: string) {
     if (!this.sock) {
@@ -986,6 +1129,8 @@ class WhatsAppGateway {
     this.markBotMessageId(resp?.key?.id);
     this.cacheMessage(resp?.key?.id, resp?.message);
 
+    const externalMessageId = resp?.key?.id || null;
+
     await prisma.messageLog.create({
       data: {
         direction: 'out',
@@ -996,9 +1141,12 @@ class WhatsAppGateway {
         rawJid: jid,
         messageType: 'text',
         content: text,
-        externalMessageId: resp?.key?.id || null,
+        externalMessageId,
       },
     });
+
+    // Persistimos el proto completo para reenvíos tras reinicio.
+    await this.persistRawProto(externalMessageId, resp?.message);
 
     logger.info(
       {
@@ -1123,6 +1271,8 @@ class WhatsAppGateway {
     this.markBotMessageId(resp?.key?.id);
     this.cacheMessage(resp?.key?.id, resp?.message);
 
+    const externalMessageId = resp?.key?.id || null;
+
     await prisma.messageLog.create({
       data: {
         direction: 'out',
@@ -1133,10 +1283,13 @@ class WhatsAppGateway {
         rawJid: jid,
         messageType: params.media_type,
         content: params.caption || '',
-        externalMessageId: resp?.key?.id || null,
+        externalMessageId,
         mimetype,
       },
     });
+
+    // Persistimos el proto completo para reenvíos tras reinicio.
+    await this.persistRawProto(externalMessageId, resp?.message);
 
     logger.info(
       {
