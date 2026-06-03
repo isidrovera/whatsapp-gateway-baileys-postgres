@@ -6,6 +6,7 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
   proto,
   WASocket,
+  type WAMessage,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 
@@ -1110,8 +1111,11 @@ class WhatsAppGateway {
 
     if (!this.sock) throw new Error('Socket no inicializado para descargar media');
 
+    // Cast necesario: downloadMediaMessage espera WAMessage (key non-nullable)
+    // pero proto.IWebMessageInfo tiene key nullable. El mensaje ya fue
+    // validado antes de llegar aquí, por lo que el cast es seguro.
     const buffer = (await downloadMediaMessage(
-      message,
+      message as WAMessage,
       'buffer',
       {},
       {

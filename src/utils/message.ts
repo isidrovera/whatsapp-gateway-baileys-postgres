@@ -1,4 +1,4 @@
-import type { proto } from 'baileys';
+import type { proto } from '@whiskeysockets/baileys';
 
 export function extractText(message: proto.IWebMessageInfo): string {
   const m = message.message;
