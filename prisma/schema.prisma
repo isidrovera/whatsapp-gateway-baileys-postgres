@@ -186,7 +186,7 @@ model MessageLog {
   outboxId          Int?
   mediaUrl          String?
   mimetype          String?
-  rawProto          Json?      // <-- AÑADIR ESTA LÍNEA
+  rawProto          Json?
   createdAt         DateTime @default(now())
 
   @@index([direction])
