@@ -1,5 +1,3 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import QRCode from 'qrcode';
 import makeWASocket, {
   Browsers,
@@ -7,9 +5,8 @@ import makeWASocket, {
   downloadMediaMessage,
   makeCacheableSignalKeyStore,
   proto,
-  useMultiFileAuthState,
   WASocket,
-} from 'baileys';
+} from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 
 import { prisma } from '../db/prisma.js';
@@ -42,6 +39,7 @@ import {
 } from './media.service.js';
 import { postToInboundWebhook } from './webhook.service.js';
 import { markOdooOutboxSent } from './odoo.service.js';
+import { usePostgresAuthState } from './auth-state.service.js';
 
 type SendMessageSafeOptions = {
   traceId?: string;
@@ -51,13 +49,10 @@ type SendMessageSafeOptions = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Versión fija de Baileys.
-// La documentación oficial advierte que NO se debe usar fetchLatestBaileysVersion
-// ni fetchLatestWaWebVersion en cada conexión porque puede introducir
-// incompatibilidades. Se usa una versión fija un par de releases atrás.
+// v7: la versión de WA Web se deja al default interno de Baileys (ProtoCocktail).
+// No fijar version manualmente ni usar fetchLatestWaWebVersion en cada conexión.
 // Ref: https://baileys.wiki/docs/socket/configuration#version
 // ─────────────────────────────────────────────────────────────────────────────
-const BAILEYS_WA_VERSION: [number, number, number] = [2, 3000, 1015901307];
 
 class WhatsAppGateway {
   private sock: WASocket | null = null;
@@ -70,8 +65,10 @@ class WhatsAppGateway {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private retryCount = 0;
 
-  // TTL del caché de mensajes (para reenvíos / getMessage).
-  // 60 min cubre con holgura la ventana típica de retry de WhatsApp.
+  // saveCreds se guarda aquí para poder llamarlo desde el evento creds.update
+  // sin tener que re-instanciar el auth state en cada reconexión.
+  private saveCreds: (() => Promise<void>) | null = null;
+
   private static readonly MESSAGE_CACHE_TTL_MS = 60 * 60 * 1000;
   private static readonly MESSAGE_CACHE_MAX = 2000;
 
@@ -141,16 +138,12 @@ class WhatsAppGateway {
 
   private isFromBotById(id?: string | null) {
     if (!id) return false;
-
     const exp = this.botSentMessageIds.get(id);
-
     if (!exp) return false;
-
     if (Date.now() > exp) {
       this.botSentMessageIds.delete(id);
       return false;
     }
-
     return true;
   }
 
@@ -190,7 +183,6 @@ class WhatsAppGateway {
     if (this.messageCache.size > WhatsAppGateway.MESSAGE_CACHE_MAX) {
       const excess = this.messageCache.size - WhatsAppGateway.MESSAGE_CACHE_MAX;
       const ids = Array.from(this.messageCache.keys()).slice(0, excess);
-
       for (const id of ids) {
         this.messageCache.delete(id);
         removedExcess++;
@@ -206,28 +198,16 @@ class WhatsAppGateway {
   // ==================================================
   // getMessage
   //
-  // La documentación oficial dice:
-  //   "needed for resending missing messages or decrypting poll votes.
-  //    Should be implemented by making a call to your database using
-  //    the message key as an index."
-  // Ref: https://baileys.wiki/docs/socket/configuration#getmessage
-  //
-  // CRÍTICO: devolver undefined es el comportamiento correcto cuando
-  // no se puede recuperar el proto original. Devolver un proto vacío
-  // o reconstruido incompleto provoca que Baileys intente re-cifrar
-  // con la sesión Signal actual, que puede estar en estado de
-  // renegociación (pendingPreKey tras rotación de sesión @lid),
-  // causando que el destinatario siga viendo "Esperando el mensaje"
-  // indefinidamente.
-  //
-  // Cuando se devuelve undefined, Baileys limpia el estado pendiente
-  // sin intentar re-cifrar con claves incoherentes.
-  //
   // Estrategia de resolución (en orden):
   //   1) Caché en memoria (proto.IMessage completo)
   //   2) BD: rawProto serializado
   //   3) BD: reconstrucción de texto plano (solo messageType=text)
   //   4) undefined → Baileys limpia el estado sin re-cifrar
+  //
+  // CRÍTICO: devolver undefined es correcto cuando no se puede recuperar
+  // el proto original. Devolver proto vacío con sesión en pendingPreKey
+  // (frecuente en v7 con LIDs) causa "Esperando el mensaje" permanente.
+  // Ref: https://baileys.wiki/docs/socket/configuration#getmessage
   // ==================================================
   private async getMessageForRetry(key: any): Promise<proto.IMessage | undefined> {
     const messageId = key?.id || '';
@@ -239,27 +219,19 @@ class WhatsAppGateway {
     );
 
     if (!messageId) {
-      logger.warn(
-        '[WA-GETMSG] sin messageId; devolviendo undefined para limpiar estado pendiente'
-      );
+      logger.warn('[WA-GETMSG] sin messageId; devolviendo undefined');
       return undefined;
     }
 
     // ── FUENTE 1: caché en memoria ──
     try {
       const cached = this.messageCache.get(messageId);
-
       if (cached) {
         if (cached.expiresAt > Date.now()) {
-          logger.info(
-            { messageId },
-            '[WA-GETMSG] ✅ resuelto desde caché en memoria'
-          );
+          logger.info({ messageId }, '[WA-GETMSG] ✅ resuelto desde caché en memoria');
           return cached.message;
         }
-
         this.messageCache.delete(messageId);
-        logger.debug({ messageId }, '[WA-GETMSG] caché expirado, eliminado');
       }
     } catch (err) {
       logger.warn({ err, messageId }, '[WA-GETMSG] error leyendo caché en memoria');
@@ -273,84 +245,42 @@ class WhatsAppGateway {
       });
 
       if (!logged) {
-        logger.warn(
-          { messageId },
-          '[WA-GETMSG] sin registro en BD; devolviendo undefined para limpiar estado pendiente'
-        );
+        logger.warn({ messageId }, '[WA-GETMSG] sin registro en BD; devolviendo undefined');
         return undefined;
       }
 
-      // FUENTE 2: rawProto serializado (cualquier tipo de mensaje).
       const rawProto = (logged as any)?.rawProto;
       if (rawProto) {
         try {
-          const parsed =
-            typeof rawProto === 'string' ? JSON.parse(rawProto) : rawProto;
-
+          const parsed = typeof rawProto === 'string' ? JSON.parse(rawProto) : rawProto;
           if (parsed && typeof parsed === 'object') {
-            logger.info(
-              { messageId, messageType: logged.messageType },
-              '[WA-GETMSG] ✅ resuelto desde BD (rawProto)'
-            );
+            logger.info({ messageId }, '[WA-GETMSG] ✅ resuelto desde BD (rawProto)');
             this.cacheMessage(messageId, parsed as proto.IMessage);
             return parsed as proto.IMessage;
           }
         } catch (err) {
-          logger.warn(
-            { err, messageId },
-            '[WA-GETMSG] rawProto presente pero no parseable; continuando a siguiente fuente'
-          );
+          logger.warn({ err, messageId }, '[WA-GETMSG] rawProto no parseable');
         }
       }
 
-      // FUENTE 3: reconstrucción de texto plano (solo messageType=text).
-      // Para otros tipos (image, audio, video, document) NO reconstruimos
-      // porque el proto reconstruido no tiene los datos de media cifrados
-      // y causaría el mismo problema de sesión incoherente.
       if (logged.messageType === 'text' && logged.content) {
-        logger.info(
-          { messageId },
-          '[WA-GETMSG] ✅ resuelto desde BD (reconstrucción de texto)'
-        );
+        logger.info({ messageId }, '[WA-GETMSG] ✅ resuelto desde BD (reconstrucción texto)');
         const reconstructed: proto.IMessage = { conversation: logged.content };
         this.cacheMessage(messageId, reconstructed);
         return reconstructed;
       }
 
       logger.warn(
-        {
-          messageId,
-          messageType: logged.messageType,
-          hasRawProto: !!rawProto,
-          hasContent: !!logged.content,
-        },
-        '[WA-GETMSG] registro hallado pero no reconstruible; devolviendo undefined para limpiar estado pendiente'
+        { messageId, messageType: logged.messageType },
+        '[WA-GETMSG] registro hallado pero no reconstruible; devolviendo undefined'
       );
       return undefined;
-
     } catch (err) {
-      logger.warn(
-        { err: this.serializeError(err), messageId },
-        '[WA-GETMSG] error consultando BD; devolviendo undefined'
-      );
+      logger.warn({ err: this.serializeError(err), messageId }, '[WA-GETMSG] error en BD');
     }
 
-    // ── FUENTE 4: undefined ──
-    logger.warn(
-      { messageId },
-      '[WA-GETMSG] todas las fuentes agotadas; devolviendo undefined para limpiar estado pendiente'
-    );
+    logger.warn({ messageId }, '[WA-GETMSG] todas las fuentes agotadas; devolviendo undefined');
     return undefined;
-  }
-
-  private async getAuthDir() {
-    const dir = path.resolve(
-      (await getConfigValue('AUTH_DIR')) || './storage/auth'
-    );
-
-    fs.mkdirSync(dir, { recursive: true });
-
-    return dir;
   }
 
   private scheduleReconnect(forceNew = false) {
@@ -362,9 +292,7 @@ class WhatsAppGateway {
     const delay = Math.min(3000 * Math.pow(2, this.retryCount), 60000);
     this.retryCount += 1;
 
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-    }
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 
     logger.info(
       { retryCount: this.retryCount, delayMs: delay, forceNew },
@@ -381,15 +309,12 @@ class WhatsAppGateway {
 
   private isInternalOrUnsupportedMessage(message: proto.IWebMessageInfo) {
     const raw: any = message.message || {};
-
     if (!raw || Object.keys(raw).length === 0) return true;
     if (raw.protocolMessage) return true;
-
     const keys = Object.keys(raw);
     if (raw.senderKeyDistributionMessage && keys.length === 1) return true;
     if (raw.messageContextInfo && keys.length === 1) return true;
     if ((message as any).messageStubType) return true;
-
     return false;
   }
 
@@ -399,33 +324,36 @@ class WhatsAppGateway {
 
   private getTimestampMs(message: proto.IWebMessageInfo) {
     const raw = Number(message.messageTimestamp || 0);
-
     if (!raw) return Date.now();
     if (raw > 1000000000000) return raw;
-
     return raw * 1000;
   }
 
   private normalizePhoneCandidate(value?: string | null): string {
     const raw = String(value || '').trim();
-
     if (!raw) return '';
     if (isLidJid(raw)) return '';
-
     const digits = cleanPhone(raw);
-
     if (!digits) return '';
-
     return digits;
   }
 
+  // ==================================================
+  // RESOLUCIÓN DE LID → PN
+  //
+  // v7: el mapeo LID↔PN es ahora obligatorio en todas las sesiones nuevas.
+  // Los campos canónicos remoteJidAlt (DMs) y participantAlt (grupos) son
+  // provistos directamente en el MessageKey por WhatsApp.
+  // Fallback: signalRepository.lidMapping.getPNForLID (persiste en
+  // WhatsappAuthState gracias al auth state de Prisma).
+  // Ref: https://baileys.wiki/docs/migration/to-v7.0.0#lids
+  // ==================================================
   private async resolvePhoneFromLid(
     lidJid?: string | null,
     key?: any
   ): Promise<{ phone: string; jid: string; source: string } | null> {
     try {
       const lid = normalizeLidJid(lidJid) || String(lidJid || '').trim();
-
       if (!lid || !isLidJid(lid)) return null;
 
       const possibleAltValues = [
@@ -441,7 +369,6 @@ class WhatsAppGateway {
       for (const item of possibleAltValues) {
         if (item && isPnJid(item)) {
           const phone = this.normalizePhoneCandidate(item);
-
           if (phone) {
             return { phone, jid: `${phone}@s.whatsapp.net`, source: 'message_key_alt' };
           }
@@ -457,7 +384,6 @@ class WhatsAppGateway {
       }
 
       const result = await lidMapping.getPNForLID(lid);
-
       if (!result) {
         logger.debug({ lid }, '[LID] sin resultado getPNForLID');
         return null;
@@ -469,7 +395,6 @@ class WhatsAppGateway {
           : result?.jid || result?.pn || result?.phoneNumber || '';
 
       const phone = this.normalizePhoneCandidate(value);
-
       if (!phone) {
         logger.debug({ lid, result }, '[LID] getPNForLID devolvió valor no usable');
         return null;
@@ -492,7 +417,7 @@ class WhatsAppGateway {
 
     if (!resolved) {
       logger.info(
-        { lid: ids.lid, raw_jid: ids.raw_jid, candidates: ids.candidates },
+        { lid: ids.lid, raw_jid: ids.raw_jid },
         '[LID] no se pudo completar teléfono; se enviará solo LID'
       );
       return ids;
@@ -500,7 +425,6 @@ class WhatsAppGateway {
 
     ids.phone = resolved.phone;
     ids.jid = resolved.jid;
-
     if (!ids.alt_jid) ids.alt_jid = resolved.jid;
 
     logger.info(
@@ -540,25 +464,12 @@ class WhatsAppGateway {
     options: SendMessageSafeOptions = {}
   ) {
     if (!this.sock || !this.ready) {
-      const error = new Error('WhatsApp no conectado');
-
-      logger.error(
-        {
-          jid,
-          outboxId: options.outboxId || false,
-          traceId: options.traceId || '',
-          ready: this.ready,
-          hasSocket: !!this.sock,
-        },
-        '[WA-OUT] intento de envío sin conexión'
-      );
-
-      throw error;
+      throw new Error('WhatsApp no conectado');
     }
 
     const timeoutMs =
       options.timeoutMs ||
-      await this.getSendTimeoutMs(options.messageType === 'text' ? 30000 : 60000);
+      (await this.getSendTimeoutMs(options.messageType === 'text' ? 30000 : 60000));
 
     const startedAt = Date.now();
 
@@ -569,7 +480,6 @@ class WhatsAppGateway {
         outboxId: options.outboxId || false,
         messageType: options.messageType || 'unknown',
         timeoutMs,
-        connected: this.ready,
       },
       '[WA-OUT] iniciando envío'
     );
@@ -597,7 +507,6 @@ class WhatsAppGateway {
       );
 
       const externalMessageId = resp?.key?.id || '';
-
       if (!externalMessageId) {
         throw new Error(`Baileys no devolvió externalMessageId para ${jid}`);
       }
@@ -628,10 +537,7 @@ class WhatsAppGateway {
           outboxId: options.outboxId || false,
           messageType: options.messageType || 'unknown',
         },
-        response: {
-          externalMessageId,
-          elapsedMs: Date.now() - startedAt,
-        },
+        response: { externalMessageId, elapsedMs: Date.now() - startedAt },
       });
 
       return resp;
@@ -698,16 +604,12 @@ class WhatsAppGateway {
       jid: params.jid && !isLidJid(params.jid) ? params.jid : null,
       lid: params.jid && isLidJid(params.jid) ? params.jid : null,
       rawJid: params.jid || null,
-      payload: {
-        outboxId: params.outboxId,
-        traceId: params.traceId || '',
-      },
+      payload: { outboxId: params.outboxId, traceId: params.traceId || '' },
       error: serialized.message,
       response: serialized,
     });
   }
 
-  // Guarda el proto completo del mensaje en BD (defensivo respecto al schema).
   private async persistRawProto(
     externalMessageId: string | null | undefined,
     message: proto.IMessage | null | undefined
@@ -716,16 +618,11 @@ class WhatsAppGateway {
 
     try {
       const serialized = JSON.stringify(message);
-
       await prisma.messageLog.updateMany({
         where: { externalMessageId },
         data: { rawProto: serialized } as any,
       });
-
-      logger.debug(
-        { externalMessageId },
-        '[WA-CACHE] rawProto persistido en BD'
-      );
+      logger.debug({ externalMessageId }, '[WA-CACHE] rawProto persistido en BD');
     } catch (err) {
       logger.debug(
         { err: this.serializeError(err), externalMessageId },
@@ -734,47 +631,48 @@ class WhatsAppGateway {
     }
   }
 
+  // ==================================================
+  // INITIALIZE
+  //
+  // v7 + Prisma auth state:
+  //   - usePostgresAuthState(prisma) reemplaza useMultiFileAuthState.
+  //     Persiste creds + todas las claves Signal (incluyendo las nuevas
+  //     de v7: lid-mapping, device-list, tctoken) en PostgreSQL.
+  //   - forceNew=true limpia la sesión completa de la BD (clearAll)
+  //     antes de reinicializar con creds frescas.
+  //   - saveCreds se guarda en this.saveCreds para reutilizarlo en
+  //     reconexiones sin re-instanciar el auth state.
+  //   - version omitido → Baileys v7 lo gestiona internamente.
+  //     Ref: https://baileys.wiki/docs/socket/configuration#version
+  // ==================================================
   async initialize(forceNew = false) {
-    const authDir = await this.getAuthDir();
-
-    if (forceNew && fs.existsSync(authDir)) {
-      fs.rmSync(authDir, { recursive: true, force: true });
-      fs.mkdirSync(authDir, { recursive: true });
+    // Si forceNew, borrar toda la sesión de la BD antes de arrancar.
+    if (forceNew) {
+      const { clearAll } = await usePostgresAuthState(prisma);
+      await clearAll();
+      logger.info('[WA] sesión anterior eliminada de BD (forceNew=true)');
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    const { state, saveCreds } = await usePostgresAuthState(prisma);
 
-    logger.info(
-      {
-        version: BAILEYS_WA_VERSION.join('.'),
-        authDir,
-        forceNew,
-      },
-      'Iniciando Baileys'
-    );
+    // Guardar saveCreds en la instancia para reutilizarlo en reconexiones.
+    this.saveCreds = saveCreds;
+
+    logger.info({ forceNew }, 'Iniciando Baileys v7 con auth state PostgreSQL');
 
     // ─────────────────────────────────────────────────────────────────────
-    // browser: Browsers.macOS('Desktop') según la documentación oficial.
-    // Se usa Desktop para emular cliente de escritorio y recibir eventos
-    // de history sync correctamente.
-    // Ref: https://baileys.wiki/docs/socket/configuration#browser
+    // browser: Browsers.macOS('Desktop') → recibir history sync completo.
+    // Ref: https://baileys.wiki/docs/socket/configuration#syncfullhistory
     //
-    // version: fija, NO fetchLatestBaileysVersion en cada reconexión.
-    // Ref: https://baileys.wiki/docs/socket/configuration#version
+    // markOnlineOnConnect: false → no marcar online al conectar para
+    // evitar perder notificaciones en el móvil.
+    // Ref: https://baileys.wiki/docs/socket/configuration#markonlineonconnect
     //
-    // getMessage: debe devolver undefined cuando no puede resolver,
-    // NO un proto vacío. Devolver proto vacío con sesión en pendingPreKey
-    // causa "Esperando el mensaje" permanente en @lid JIDs.
+    // getMessage: devuelve undefined cuando no puede recuperar el proto.
+    // NUNCA devolver proto vacío con sesión en pendingPreKey (@lid).
     // Ref: https://baileys.wiki/docs/socket/configuration#getmessage
-    //
-    // shouldSyncHistoryMessage: habilitado (eliminar el () => false) para
-    // recibir el evento messaging-history.set que provee mensajes históricos
-    // al caché. Sin esto, getMessage no puede resolver mensajes anteriores
-    // al último reinicio del gateway.
-    // Ref: https://baileys.wiki/docs/socket/history-sync
     // ─────────────────────────────────────────────────────────────────────
     this.sock = makeWASocket({
-      version: BAILEYS_WA_VERSION,
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger as any),
@@ -782,52 +680,47 @@ class WhatsAppGateway {
 
       logger: logger as any,
 
-      // Desktop para recibir history sync completo.
       browser: Browsers.macOS('Desktop'),
 
       printQRInTerminal: false,
       markOnlineOnConnect: false,
-
-      // syncFullHistory habilita los eventos de history sync completo
-      // desde el dispositivo principal.
       syncFullHistory: true,
-
-      // Sin shouldSyncHistoryMessage = false, Baileys procesa los mensajes
-      // históricos y los entrega via messaging-history.set para que podamos
-      // cachearlos y servirlos desde getMessage.
-      // shouldSyncHistoryMessage no se define → comportamiento por defecto.
-
       generateHighQualityLinkPreview: false,
 
-      getMessage: async (key: any) => {
-        return this.getMessageForRetry(key);
-      },
+      getMessage: async (key: any) => this.getMessageForRetry(key),
 
       connectTimeoutMs: 60000,
       keepAliveIntervalMs: 15000,
       defaultQueryTimeoutMs: 60000,
     });
 
-    this.sock.ev.on('creds.update', saveCreds);
+    // Persistir creds cada vez que Baileys las actualiza.
+    this.sock.ev.on('creds.update', async () => {
+      if (this.saveCreds) {
+        await this.saveCreds();
+      }
+    });
 
     // ─────────────────────────────────────────────────────────────────────
-    // messaging-history.set
+    // lid-mapping.update (nuevo en v7)
     //
-    // La documentación oficial dice:
-    //   "you should keep a record of messages so you can provide those
-    //    messages to the getMessage function"
-    // Ref: https://baileys.wiki/docs/socket/history-sync
-    //
-    // Cacheamos todos los mensajes históricos al recibirlos para que
-    // getMessage pueda servirlos en reenvíos sin necesidad de consultar BD.
+    // Emitido cuando el dispositivo principal envía nuevos mapeos LID↔PN.
+    // El auth state de Prisma los persiste automáticamente a través de
+    // keys.set('lid-mapping', ...) — este listener es solo para logging.
+    // Ref: https://baileys.wiki/docs/migration/to-v7.0.0#lids
     // ─────────────────────────────────────────────────────────────────────
+    this.sock.ev.on('lid-mapping.update', (mappings) => {
+      logger.info(
+        { count: Array.isArray(mappings) ? mappings.length : 1 },
+        '[LID] lid-mapping.update recibido; mapeo LID↔PN persistido en BD'
+      );
+    });
+
+    // messaging-history.set: cachear mensajes históricos para getMessage.
+    // Ref: https://baileys.wiki/docs/socket/history-sync
     this.sock.ev.on('messaging-history.set', ({ messages, syncType }) => {
       const total = messages?.length || 0;
-
-      logger.info(
-        { syncType, total },
-        '[WA-HISTORY] messaging-history.set recibido; cacheando mensajes históricos'
-      );
+      logger.info({ syncType, total }, '[WA-HISTORY] cacheando mensajes históricos');
 
       let cached = 0;
       let skipped = 0;
@@ -835,7 +728,6 @@ class WhatsAppGateway {
       for (const msg of messages || []) {
         const id = msg.key?.id;
         const message = msg.message;
-
         if (id && message) {
           this.cacheMessage(id, message);
           cached++;
@@ -844,10 +736,7 @@ class WhatsAppGateway {
         }
       }
 
-      logger.info(
-        { syncType, total, cached, skipped },
-        '[WA-HISTORY] mensajes históricos cacheados'
-      );
+      logger.info({ syncType, total, cached, skipped }, '[WA-HISTORY] mensajes cacheados');
     });
 
     this.sock.ev.on(
@@ -855,7 +744,6 @@ class WhatsAppGateway {
       async ({ connection, lastDisconnect, qr }) => {
         if (qr) {
           this.currentQR = qr;
-
           try {
             this.qrDataURL = await QRCode.toDataURL(qr);
             logger.info('QR disponible en /api/qr');
@@ -880,12 +768,11 @@ class WhatsAppGateway {
           logger.info(
             {
               user: this.sock?.user,
-              version: BAILEYS_WA_VERSION.join('.'),
               browser: 'macOS Desktop',
               markOnlineOnConnect: false,
               keepAliveIntervalMs: 15000,
             },
-            'WhatsApp conectado'
+            'WhatsApp conectado (Baileys v7 + auth PostgreSQL)'
           );
 
           await this.createTraceLog({
@@ -893,10 +780,8 @@ class WhatsAppGateway {
             status: 'success',
             payload: {
               user: this.sock?.user || null,
-              version: BAILEYS_WA_VERSION.join('.'),
               browser: 'macOS Desktop',
               markOnlineOnConnect: false,
-              keepAliveIntervalMs: 15000,
             },
           });
         }
@@ -920,25 +805,19 @@ class WhatsAppGateway {
           });
 
           if (code === DisconnectReason.restartRequired) {
-            logger.info(
-              { code },
-              '[WA-CONN] restartRequired recibido, reconectando'
-            );
+            logger.info({ code }, '[WA-CONN] restartRequired, reconectando');
             return this.scheduleReconnect(false);
           }
 
           if (code === DisconnectReason.loggedOut) {
-            logger.warn(
-              { code },
-              '[WA-CONN] loggedOut recibido, se forzará nueva sesión'
-            );
+            logger.warn({ code }, '[WA-CONN] loggedOut, forzando nueva sesión');
             return this.scheduleReconnect(true);
           }
 
           if (code === 405) {
             logger.error(
               { code, error: errorMessage },
-              'Error 405 WhatsApp. No se reconecta para evitar bloqueo.'
+              'Error 405. No se reconecta para evitar bloqueo.'
             );
             return;
           }
@@ -959,9 +838,6 @@ class WhatsAppGateway {
             participant: m.key?.participant,
             remoteJidAlt: (m.key as any)?.remoteJidAlt,
             participantAlt: (m.key as any)?.participantAlt,
-            senderPn: (m.key as any)?.senderPn,
-            participantPn: (m.key as any)?.participantPn,
-            remoteJidPn: (m.key as any)?.remoteJidPn,
             fromMe: m.key?.fromMe,
             hasMessage: !!m.message,
             keys: m.message ? Object.keys(m.message as any) : [],
@@ -971,20 +847,14 @@ class WhatsAppGateway {
         '[WA-IN] messages.upsert recibido'
       );
 
-      // Cacheamos TODOS los mensajes (cualquier type) para soportar reenvíos.
-      // La doc dice que notify = mensajes nuevos, append = ya vistos/manejados.
-      // Ambos son útiles para getMessage.
-      // Ref: https://baileys.wiki/docs/socket/receiving-updates#messagesupsert
+      // Cachear todos los mensajes (cualquier type) para getMessage.
       for (const m of messages || []) {
         this.cacheMessage(m.key?.id, m.message);
       }
 
-      // Solo procesamos 'notify' para la lógica de negocio.
+      // Solo procesar 'notify' para lógica de negocio.
       if (type !== 'notify') {
-        logger.debug(
-          { type },
-          '[WA-IN] upsert ignorado por tipo (solo cacheado)'
-        );
+        logger.debug({ type }, '[WA-IN] upsert ignorado por tipo (solo cacheado)');
         return;
       }
 
@@ -995,15 +865,14 @@ class WhatsAppGateway {
 
     logger.info(
       {
-        version: BAILEYS_WA_VERSION.join('.'),
-        authDir,
         browser: 'macOS Desktop',
         markOnlineOnConnect: false,
         syncFullHistory: true,
         generateHighQualityLinkPreview: false,
         keepAliveIntervalMs: 15000,
+        authState: 'PostgreSQL',
       },
-      '[WA] Cliente Baileys inicializado'
+      '[WA] Cliente Baileys v7 inicializado'
     );
   }
 
@@ -1011,7 +880,6 @@ class WhatsAppGateway {
     if (!this.sock) throw new Error('Socket no inicializado');
 
     const clean = phone.replace(/\D+/g, '');
-
     if (!clean) throw new Error('Teléfono inválido para pairing code');
 
     logger.info({ phone: clean }, '[WA-AUTH] solicitando pairing code');
@@ -1043,19 +911,20 @@ class WhatsAppGateway {
 
     this.sock = null;
     this.ready = false;
+    this.saveCreds = null;
   }
 
   async getGroups() {
     if (!this.sock || !this.ready) throw new Error('WhatsApp no conectado');
 
     const rawGroups = await this.sock.groupFetchAllParticipating();
+
+    // v7: owner es ahora LID; ownerPn tiene el PN asociado.
     const groups = Object.values(rawGroups || {}).map((group: any) => ({
       id: group.id,
       name: group.subject || group.name || group.id,
       subject: group.subject || group.name || group.id,
-      participants_count: Array.isArray(group.participants)
-        ? group.participants.length
-        : 0,
+      participants_count: Array.isArray(group.participants) ? group.participants.length : 0,
       owner: group.owner || false,
       creation: group.creation || false,
     }));
@@ -1073,7 +942,6 @@ class WhatsAppGateway {
     if (!this.sock || !this.ready) throw new Error('WhatsApp no conectado');
 
     const text = String(message || '').trim();
-
     if (!text) throw new Error('Mensaje vacío');
 
     const jid = jidFromTo(to);
@@ -1086,7 +954,7 @@ class WhatsAppGateway {
         ...options,
         traceId,
         messageType: 'text',
-        timeoutMs: options.timeoutMs || await this.getSendTimeoutMs(30000),
+        timeoutMs: options.timeoutMs || (await this.getSendTimeoutMs(30000)),
       }
     );
 
@@ -1112,12 +980,7 @@ class WhatsAppGateway {
     await this.persistRawProto(externalMessageId, resp?.message);
 
     logger.info(
-      {
-        to: jid,
-        traceId,
-        outboxId: options.outboxId || false,
-        externalMessageId: resp?.key?.id,
-      },
+      { to: jid, traceId, outboxId: options.outboxId || false, externalMessageId: resp?.key?.id },
       'Mensaje de texto enviado'
     );
 
@@ -1237,10 +1100,7 @@ class WhatsAppGateway {
     return resp;
   }
 
-  private async buildMediaPayload(
-    message: proto.IWebMessageInfo,
-    messageType: string
-  ) {
+  private async buildMediaPayload(message: proto.IWebMessageInfo, messageType: string) {
     if (!['image', 'audio', 'video', 'document', 'sticker'].includes(messageType)) {
       return null;
     }
@@ -1311,9 +1171,6 @@ class WhatsAppGateway {
           participant: message.key?.participant || '',
           remoteJidAlt: (message.key as any)?.remoteJidAlt,
           participantAlt: (message.key as any)?.participantAlt,
-          senderPn: (message.key as any)?.senderPn,
-          participantPn: (message.key as any)?.participantPn,
-          remoteJidPn: (message.key as any)?.remoteJidPn,
           hasMessage: !!message.message,
           keys: message.message ? Object.keys(message.message as any) : [],
         },
@@ -1336,20 +1193,12 @@ class WhatsAppGateway {
       }
 
       if (this.isFromBotById(messageId)) {
-        logger.info({ traceId, messageId, remoteJid }, '[WA-IN] mensaje enviado por bot ignorado');
+        logger.info({ traceId, messageId, remoteJid }, '[WA-IN] mensaje bot ignorado');
         return;
       }
 
       if (this.isInternalOrUnsupportedMessage(message)) {
-        logger.info(
-          {
-            traceId,
-            messageId,
-            remoteJid,
-            keys: message.message ? Object.keys(message.message as any) : [],
-          },
-          '[WA-IN] mensaje interno/no soportado ignorado'
-        );
+        logger.info({ traceId, messageId, remoteJid }, '[WA-IN] mensaje interno/no soportado ignorado');
         return;
       }
 
@@ -1377,20 +1226,16 @@ class WhatsAppGateway {
           lid: ids.lid,
           raw_jid: ids.raw_jid,
           alt_jid: ids.alt_jid,
-          candidates: ids.candidates,
-          key: message.key,
           messageType,
           text,
         },
         '[WA-IN] mensaje normalizado'
       );
 
-      const media = await this.buildMediaPayload(message, messageType).catch(
-        (err) => {
-          logger.error({ err, traceId, messageId }, '[WA-IN] error descargando media');
-          return null;
-        }
-      );
+      const media = await this.buildMediaPayload(message, messageType).catch((err) => {
+        logger.error({ err, traceId, messageId }, '[WA-IN] error descargando media');
+        return null;
+      });
 
       const finalText = text || (media ? `[El usuario envió ${messageType}]` : '');
 
@@ -1433,14 +1278,7 @@ class WhatsAppGateway {
       };
 
       logger.info(
-        {
-          traceId,
-          messageId,
-          phone: ids.phone,
-          jid: ids.jid,
-          lid: ids.lid,
-          message: finalText,
-        },
+        { traceId, messageId, phone: ids.phone, jid: ids.jid, lid: ids.lid, message: finalText },
         '[WA-IN] enviando a webhook n8n/Odoo'
       );
 
@@ -1489,17 +1327,10 @@ class WhatsAppGateway {
         );
 
         if (response.outbox_id) {
-          await markOdooOutboxSent(
-            Number(response.outbox_id),
-            sent?.key?.id || ''
-          );
+          await markOdooOutboxSent(Number(response.outbox_id), sent?.key?.id || '');
 
           logger.info(
-            {
-              traceId,
-              outbox_id: response.outbox_id,
-              externalMessageId: sent?.key?.id || '',
-            },
+            { traceId, outbox_id: response.outbox_id, externalMessageId: sent?.key?.id || '' },
             '[ODOO-OUTBOX] marcado como enviado'
           );
         }
@@ -1510,7 +1341,6 @@ class WhatsAppGateway {
           traceId,
           error: sendErr,
         });
-
         throw sendErr;
       }
     } catch (err) {

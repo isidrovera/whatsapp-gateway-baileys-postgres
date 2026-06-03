@@ -195,3 +195,19 @@ model MessageLog {
   @@index([outboxId])
   @@index([createdAt])
 }
+model WhatsappAuthState {
+  id        Int      @id @default(autoincrement())
+  // 'creds' | 'pre-key' | 'session' | 'sender-key' | 'sender-key-memory'
+  // | 'app-state-sync-key' | 'app-state-sync-version'
+  // | 'lid-mapping' | 'device-list' | 'tctoken'
+  kind      String
+  // Para kind='creds' este campo es siempre 'creds'.
+  // Para keys es el id de la clave (ej: '0', jid, etc.)
+  keyId     String
+  value     Json
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  @@unique([kind, keyId])
+  @@index([kind])
+}
