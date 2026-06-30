@@ -647,11 +647,40 @@ class WhatsAppGateway {
   //     Ref: https://baileys.wiki/docs/socket/configuration#version
   // ==================================================
   async initialize(forceNew = false) {
+    logger.info(
+      {
+        forceNew,
+        hasSocket: !!this.sock,
+        ready: this.ready,
+        retryCount: this.retryCount,
+        hasQR: !!this.currentQR,
+      },
+      '[WA] initialize solicitado'
+    );
+
+    // Evita sockets duplicados cuando hay reconexiones rápidas.
+    if (this.sock) {
+      try {
+        logger.warn('[WA] socket anterior detectado; cerrando antes de reinicializar');
+        this.sock.end(undefined);
+      } catch (err) {
+        logger.warn({ err: this.serializeError(err) }, '[WA] error cerrando socket anterior');
+      }
+
+      this.sock = null;
+      this.ready = false;
+      this.saveCreds = null;
+    }
+
     // Si forceNew, borrar toda la sesión de la BD antes de arrancar.
     if (forceNew) {
+      this.currentQR = null;
+      this.qrDataURL = null;
+      this.retryCount = 0;
+
       const { clearAll } = await usePostgresAuthState(prisma);
       await clearAll();
-      logger.info('[WA] sesión anterior eliminada de BD (forceNew=true)');
+      logger.warn('[WA] sesión anterior eliminada de BD (forceNew=true)');
     }
 
     const { state, saveCreds } = await usePostgresAuthState(prisma);
@@ -659,7 +688,15 @@ class WhatsAppGateway {
     // Guardar saveCreds en la instancia para reutilizarlo en reconexiones.
     this.saveCreds = saveCreds;
 
-    logger.info({ forceNew }, 'Iniciando Baileys v7 con auth state PostgreSQL');
+    logger.info(
+      {
+        forceNew,
+        hasCreds: !!state?.creds,
+        registered: !!state?.creds?.registered,
+        retryCount: this.retryCount,
+      },
+      'Iniciando Baileys v7 con auth state PostgreSQL'
+    );
 
     // ─────────────────────────────────────────────────────────────────────
     // browser: Browsers.macOS('Desktop') → recibir history sync completo.
@@ -742,20 +779,55 @@ class WhatsAppGateway {
 
     this.sock.ev.on(
       'connection.update',
-      async ({ connection, lastDisconnect, qr }) => {
+      async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        const code = (lastDisconnect?.error as Boom)?.output?.statusCode;
+        const errorMessage = (lastDisconnect?.error as any)?.message || '';
+
+        logger.info(
+          {
+            connection: connection || null,
+            hasQR: !!qr,
+            qrLength: qr ? qr.length : 0,
+            code: code || null,
+            error: errorMessage || null,
+            retryCount: this.retryCount,
+            ready: this.ready,
+            currentHasQR: !!this.currentQR,
+            isNewLogin: !this.ready && !this.sock?.user,
+          },
+          '[WA-CONN] connection.update recibido'
+        );
+
         if (qr) {
+          this.ready = false;
           this.currentQR = qr;
+
           try {
             this.qrDataURL = await QRCode.toDataURL(qr);
-            logger.info('QR disponible en /api/qr');
+            logger.info(
+              {
+                qrLength: qr.length,
+                hasDataURL: !!this.qrDataURL,
+              },
+              '[WA-AUTH] QR generado y disponible en /api/qr'
+            );
           } catch (err) {
-            logger.error({ err }, '[WA-AUTH] error generando QR DataURL');
+            this.qrDataURL = null;
+            logger.error(
+              { err: this.serializeError(err) },
+              '[WA-AUTH] error generando QR DataURL'
+            );
           }
         }
 
         if (connection === 'connecting') {
+          this.ready = false;
           logger.info(
-            { retryCount: this.retryCount, hasQR: !!this.currentQR },
+            {
+              retryCount: this.retryCount,
+              hasQR: !!this.currentQR,
+            },
             '[WA-CONN] conectando a WhatsApp'
           );
         }
@@ -773,7 +845,7 @@ class WhatsAppGateway {
               markOnlineOnConnect: false,
               keepAliveIntervalMs: 15000,
             },
-            'WhatsApp conectado (Baileys v7 + auth PostgreSQL)'
+            '[WA-CONN] WhatsApp conectado correctamente'
           );
 
           await this.createTraceLog({
@@ -790,40 +862,67 @@ class WhatsAppGateway {
         if (connection === 'close') {
           this.ready = false;
 
-          const code = (lastDisconnect?.error as Boom)?.output?.statusCode;
-          const errorMessage = (lastDisconnect?.error as any)?.message || '';
-
           logger.warn(
-            { code, error: errorMessage, retryCount: this.retryCount },
-            'WhatsApp desconectado'
+            {
+              code,
+              error: errorMessage,
+              retryCount: this.retryCount,
+              hasQR: !!this.currentQR,
+            },
+            '[WA-CONN] WhatsApp desconectado'
           );
 
           await this.createTraceLog({
             type: 'whatsapp.connection.close',
             status: 'error',
-            payload: { code, error: errorMessage, retryCount: this.retryCount },
+            payload: {
+              code,
+              error: errorMessage,
+              retryCount: this.retryCount,
+              hasQR: !!this.currentQR,
+            },
             error: errorMessage || `Disconnect code ${code || 'unknown'}`,
           });
 
-          if (code === DisconnectReason.restartRequired) {
-            logger.info({ code }, '[WA-CONN] restartRequired, reconectando');
-            return this.scheduleReconnect(false);
+          if (code === DisconnectReason.loggedOut || code === 401) {
+            logger.warn(
+              { code },
+              '[WA-CONN] sesión inválida/loggedOut; se forzará nueva sesión'
+            );
+            this.currentQR = null;
+            this.qrDataURL = null;
+            return this.scheduleReconnect(true);
           }
 
-          if (code === DisconnectReason.loggedOut) {
-            logger.warn({ code }, '[WA-CONN] loggedOut, forzando nueva sesión');
-            return this.scheduleReconnect(true);
+          if (code === DisconnectReason.restartRequired) {
+            logger.info(
+              { code },
+              '[WA-CONN] restartRequired; reconectando sin borrar sesión'
+            );
+            return this.scheduleReconnect(false);
           }
 
           if (code === 405) {
             logger.error(
               { code, error: errorMessage },
-              'Error 405. No se reconecta para evitar bloqueo.'
+              '[WA-CONN] error 405; no se reconecta para evitar bloqueo'
             );
             return;
           }
 
-          this.scheduleReconnect(false);
+          if (this.retryCount >= 3 && !this.currentQR) {
+            logger.warn(
+              {
+                retryCount: this.retryCount,
+                code,
+                error: errorMessage,
+              },
+              '[WA-CONN] varios reintentos sin QR; forzando sesión nueva'
+            );
+            return this.scheduleReconnect(true);
+          }
+
+          return this.scheduleReconnect(false);
         }
       }
     );
