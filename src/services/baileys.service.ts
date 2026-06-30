@@ -684,6 +684,24 @@ class WhatsAppGateway {
     }
 
     const { state, saveCreds } = await usePostgresAuthState(prisma);
+    if (!forceNew && state?.creds && state.creds.registered === false && this.retryCount >= 2) {
+      logger.warn(
+        {
+          registered: state.creds.registered,
+          retryCount: this.retryCount,
+        },
+        '[WA-AUTH] credenciales incompletas detectadas; limpiando sesión PostgreSQL'
+      );
+
+      const { clearAll } = await usePostgresAuthState(prisma);
+      await clearAll();
+
+      this.currentQR = null;
+      this.qrDataURL = null;
+      this.retryCount = 0;
+
+      return this.initialize(true);
+    };
 
     // Guardar saveCreds en la instancia para reutilizarlo en reconexiones.
     this.saveCreds = saveCreds;
