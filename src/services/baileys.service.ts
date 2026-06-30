@@ -702,7 +702,7 @@ class WhatsAppGateway {
 
       await this.initialize(true);
       return;
-    };
+    }
 
     // Guardar saveCreds en la instancia para reutilizarlo en reconexiones.
     this.saveCreds = saveCreds;
@@ -718,8 +718,8 @@ class WhatsAppGateway {
     );
 
     // ─────────────────────────────────────────────────────────────────────
-    // browser: Browsers.macOS('Desktop') → recibir history sync completo.
-    // Ref: https://baileys.wiki/docs/socket/configuration#syncfullhistory
+    // browser: Browsers.ubuntu('Chrome') → conexión más estable para QR/pairing en VPS.
+    // syncFullHistory:false evita sincronización pesada durante registro inicial.
     //
     // markOnlineOnConnect: false → no marcar online al conectar para
     // evitar perder notificaciones en el móvil.
@@ -737,11 +737,11 @@ class WhatsAppGateway {
 
       logger: logger as any,
 
-      browser: Browsers.macOS('Desktop'),
+      browser: Browsers.ubuntu('Chrome'),
 
-      printQRInTerminal: false,
+      printQRInTerminal: true,
       markOnlineOnConnect: false,
-      syncFullHistory: true,
+      syncFullHistory: false,
       generateHighQualityLinkPreview: false,
 
       getMessage: async (key: any) => this.getMessageForRetry(key),
@@ -860,7 +860,7 @@ class WhatsAppGateway {
           logger.info(
             {
               user: this.sock?.user,
-              browser: 'macOS Desktop',
+              browser: 'Ubuntu Chrome',
               markOnlineOnConnect: false,
               keepAliveIntervalMs: 15000,
             },
@@ -872,7 +872,7 @@ class WhatsAppGateway {
             status: 'success',
             payload: {
               user: this.sock?.user || null,
-              browser: 'macOS Desktop',
+              browser: 'Ubuntu Chrome',
               markOnlineOnConnect: false,
             },
           });
@@ -984,9 +984,9 @@ class WhatsAppGateway {
 
     logger.info(
       {
-        browser: 'macOS Desktop',
+        browser: 'Ubuntu Chrome',
         markOnlineOnConnect: false,
-        syncFullHistory: true,
+        syncFullHistory: false,
         generateHighQualityLinkPreview: false,
         keepAliveIntervalMs: 15000,
         authState: 'PostgreSQL',
@@ -995,15 +995,79 @@ class WhatsAppGateway {
     );
   }
 
-  async requestPairingCode(phone: string) {
-    if (!this.sock) throw new Error('Socket no inicializado');
-
+  async requestPairingCode(phone: string): Promise<string> {
     const clean = phone.replace(/\D+/g, '');
     if (!clean) throw new Error('Teléfono inválido para pairing code');
 
-    logger.info({ phone: clean }, '[WA-AUTH] solicitando pairing code');
+    logger.info(
+      { phone: clean, hasSocket: !!this.sock, ready: this.ready, retryCount: this.retryCount },
+      '[WA-AUTH] solicitando pairing code'
+    );
 
-    return this.sock.requestPairingCode(clean);
+    // Para pairing code se necesita una sesión fresca no registrada.
+    // Si el socket quedó cerrado o en ciclo 428, se reinicia con forceNew=true.
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    if (!this.sock || this.ready || this.sock.user) {
+      logger.warn(
+        { hasSocket: !!this.sock, ready: this.ready, user: this.sock?.user || null },
+        '[WA-AUTH] socket no apto para pairing; reiniciando sesión'
+      );
+      await this.disconnect(false).catch((err: any) => {
+        logger.warn({ err: this.serializeError(err) }, '[WA-AUTH] error cerrando socket antes de pairing');
+      });
+      await this.initialize(true);
+    }
+
+    let lastError: any = null;
+
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        if (!this.sock) {
+          logger.warn({ attempt }, '[WA-AUTH] socket inexistente; reiniciando antes de pairing');
+          await this.initialize(true);
+        }
+
+        logger.info({ phone: clean, attempt }, '[WA-AUTH] enviando requestPairingCode a Baileys');
+        const code = await this.sock!.requestPairingCode(clean);
+
+        logger.info(
+          { phone: clean, attempt, codeLength: code ? String(code).length : 0 },
+          '[WA-AUTH] pairing code generado correctamente'
+        );
+
+        return code;
+      } catch (err: any) {
+        lastError = err;
+        const serialized = this.serializeError(err);
+
+        logger.warn(
+          { phone: clean, attempt, err: serialized },
+          '[WA-AUTH] error solicitando pairing code'
+        );
+
+        const msg = String(serialized.message || '').toLowerCase();
+        const connectionClosed =
+          msg.includes('closed') ||
+          msg.includes('terminated') ||
+          msg.includes('socket') ||
+          serialized.statusCode === 428;
+
+        if (!connectionClosed || attempt >= 5) {
+          break;
+        }
+
+        await this.disconnect(false).catch(() => undefined);
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        await this.initialize(true);
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    }
+
+    throw lastError || new Error('No se pudo generar pairing code');
   }
 
   async disconnect(logout = false) {
