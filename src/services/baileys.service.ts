@@ -302,7 +302,7 @@ class WhatsAppGateway {
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      this.initialize(forceNew).catch((err) =>
+      this.initialize(forceNew).catch((err: any) =>
         logger.error({ err }, 'Error reconectando WhatsApp')
       );
     }, delay);
@@ -646,7 +646,7 @@ class WhatsAppGateway {
   //   - version omitido → Baileys v7 lo gestiona internamente.
   //     Ref: https://baileys.wiki/docs/socket/configuration#version
   // ==================================================
-  async initialize(forceNew = false) {
+ async initialize(forceNew = false): Promise<void> {
     logger.info(
       {
         forceNew,
@@ -700,7 +700,8 @@ class WhatsAppGateway {
       this.qrDataURL = null;
       this.retryCount = 0;
 
-      return this.initialize(true);
+      await this.initialize(true);
+      return;
     };
 
     // Guardar saveCreds en la instancia para reutilizarlo en reconexiones.
